@@ -1238,7 +1238,11 @@ mod tests {
         assert_eq!(arb.up(11), Some(Ownership::Client));
         assert_eq!(arb.up(12), Some(Ownership::Compositor));
         for slot in [10, 11, 12] {
-            assert_eq!(arb.ownership(slot), None, "slot {slot} still tracked after up");
+            assert_eq!(
+                arb.ownership(slot),
+                None,
+                "slot {slot} still tracked after up"
+            );
         }
 
         // The ledger is empty.
@@ -1278,5 +1282,4 @@ mod tests {
         assert_eq!(arb.up(1), Some(Ownership::Client));
         assert_eq!(arb.open_client_touches(), 0);
     }
-
 }
