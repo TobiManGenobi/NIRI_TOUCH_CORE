@@ -53,37 +53,6 @@ const OUTPUT: OutputSize = OutputSize {
 /// The edge/corner strip width, matching touch-core's own default.
 const ZONE_PX: f64 = 48.0;
 
-/// Which contacts reach the recogniser.
-///
-/// This is not a free knob — it is the composition seam, and it is where the
-/// adapter's actual behaviour has to be pinned down. See
-/// [`Feed::GestureTakesTheWholeSequence`] and the
-/// `known_defect_*` test at the bottom for why it is spelled out rather than
-/// left implicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Feed {
-    /// The compositor, having taken the sequence, feeds **every physically
-    /// down contact** to the recogniser — including the ones it just
-    /// cancelled at the client.
-    ///
-    /// This is what the hardware demands. When the third finger arms, all
-    /// three contacts are still on the glass; the compositor sent two
-    /// touch-ends to the client to stop them being phantoms, but that did
-    /// not make the fingers go up. A recogniser that only ever sees the
-    /// arming contact cannot recognise a three-finger gesture, because
-    /// `min_fingers` defaults to 2.
-    GestureTakesTheWholeSequence,
-    /// The compositor feeds the recogniser only contacts it owns *at their
-    /// own down*, so contacts cancelled at the arming never arrive.
-    ///
-    /// This is what `TouchArbitrationGrab` does today: `route_down` feeds
-    /// `recognizer.down` only for slots that are in `compositor_slots`, and
-    /// a slot cancelled by `clear_clients()` is in neither set afterwards.
-    /// Kept only so the defect can be demonstrated rather than merely
-    /// asserted in prose.
-    OnlyNewlyArmedSlots,
-}
-
 /// What the fake seat would be holding.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Seat {
@@ -117,16 +86,36 @@ struct Harness {
     arb: Arbitrator,
     rec: Recognizer,
     seat: Seat,
-    /// Which layer owns each live slot, as the adapter's routing sets.
+    /// Slots the client holds, per the arbitrator's ledger.
     client_slots: BTreeSet<u32>,
-    compositor_slots: BTreeSet<u32>,
+    /// Slots the *recogniser* is tracking.
+    ///
+    /// Deliberately separate from `client_slots`, and the reason this field
+    /// is not `compositor_slots`: **ownership bookkeeping and physical
+    /// reality are different things.** When the third finger arms, the two
+    /// earlier fingers are handed back by `clear_clients()` and closed on
+    /// the seat — so they leave the client set — but they are still on the
+    /// glass, and they are part of the gesture the compositor just took. They
+    /// are retro-fed to the recogniser and belong in this set.
+    ///
+    /// Keying `motion` and `up` off the routing sets instead is the bug this
+    /// set exists to prevent: the contacts are fed at the down, then never
+    /// move, never lift, the grab never uninstalls, and the stuck contacts
+    /// poison the next gesture. Ownership answers "who should have this
+    /// touch"; this set answers "what is the recogniser actually holding".
+    fed_slots: BTreeSet<u32>,
+    /// Where each physically down contact last was.
+    ///
+    /// Needed because a retro-fed contact must be replayed to the recogniser
+    /// at *its own* start position, not wherever the finger that armed the
+    /// sequence happens to be.
+    positions: BTreeMap<u32, Point>,
     /// The ownership ruling for every down, in order.
     ownership: Vec<Ownership>,
     /// The slots cancelled at each arming, in arming order.
     cancels: Vec<Vec<u32>>,
     /// Every gesture event the recogniser produced, in order.
     events: Vec<GestureEvent>,
-    feed: Feed,
     /// Sticky flags the adapter re-reads per down rather than remembering.
     under_gesture_app: bool,
     mod_down: bool,
@@ -134,20 +123,16 @@ struct Harness {
 
 impl Harness {
     fn new(policy: Policy) -> Self {
-        Self::with_feed(policy, Feed::GestureTakesTheWholeSequence)
-    }
-
-    fn with_feed(policy: Policy, feed: Feed) -> Self {
         Self {
             arb: Arbitrator::new(policy),
             rec: Recognizer::new(RecognizerConfig::default()),
             seat: Seat::default(),
             client_slots: BTreeSet::new(),
-            compositor_slots: BTreeSet::new(),
+            fed_slots: BTreeSet::new(),
+            positions: BTreeMap::new(),
             ownership: Vec::new(),
             cancels: Vec::new(),
             events: Vec::new(),
-            feed,
             under_gesture_app: false,
             mod_down: false,
         }
@@ -175,6 +160,7 @@ impl Harness {
     /// still holds, and only then start feeding the recogniser.
     fn down(&mut self, slot: u32, pos: Point, is_pen: bool, eraser: bool, time: Duration) {
         let ctx = self.ctx(pos, is_pen, eraser);
+        self.positions.insert(slot, pos);
         let ownership = self.arb.down(slot, &ctx);
         self.ownership.push(ownership);
 
@@ -201,17 +187,21 @@ impl Harness {
                     self.cancels.push(stranded.clone());
                 }
 
-                self.compositor_slots.insert(slot);
+                // Every contact of the sequence the compositor just took is
+                // now the recogniser's, and stays its for the rest of the
+                // sequence — including the ones just cancelled at the seat,
+                // which are still on the glass.
+                self.fed_slots.insert(slot);
                 self.rec.down(Slot::new(slot), ctx.pos, ctx.zone, time);
 
-                // The composition seam. Every physically down contact belongs
-                // to the gesture now.
-                if self.feed == Feed::GestureTakesTheWholeSequence {
-                    for s in stranded {
-                        if s != slot && !self.compositor_slots.contains(&s) {
-                            self.compositor_slots.insert(s);
-                            self.rec.down(Slot::new(s), pos, None, time);
-                        }
+                // The stranded contacts join the same sequence, replayed at
+                // their own start positions and with no zone of their own —
+                // they were plain-surface contacts, and their position is
+                // where they actually are, not where the arming finger is.
+                for s in stranded {
+                    let p = self.positions.get(&s).copied().unwrap_or(ctx.pos);
+                    if self.fed_slots.insert(s) {
+                        self.rec.down(Slot::new(s), p, None, time);
                     }
                 }
             }
@@ -219,24 +209,24 @@ impl Harness {
         }
     }
 
-    /// One touch-motion, routed to whichever layer owns the slot.
+    /// One touch-motion, routed to whichever layer holds the slot.
     fn motion(&mut self, slot: u32, pos: Point) {
         if self.client_slots.contains(&slot) {
             return; // forwarded verbatim; the recogniser never sees it
         }
-        if self.compositor_slots.contains(&slot) {
+        if self.fed_slots.contains(&slot) {
             self.rec.motion(Slot::new(slot), pos);
         }
     }
 
-    /// One touch-up, routed to whichever layer owns the slot.
+    /// One touch-up, routed to whichever layer holds the slot.
     fn up(&mut self, slot: u32) {
         let owned = self.arb.up(slot);
         if self.client_slots.remove(&slot) {
             self.seat.up(slot);
             return;
         }
-        if !self.compositor_slots.remove(&slot) {
+        if !self.fed_slots.remove(&slot) {
             // An unknown slot is a desync worth noticing but not worth
             // panicking over mid-gesture; the ledger is the authority and it
             // already said what it thought.
@@ -258,23 +248,31 @@ impl Harness {
         self.events.extend(self.rec.frame(time));
     }
 
-    /// No contact may be in the recogniser without the compositor owning it.
+    /// The recogniser and `fed_slots` must agree exactly, in both
+    /// directions.
     ///
     /// A client-owned slot reaching L1/L2 would make the recogniser act on
     /// touches the client is still holding — the mirror image of the phantom
-    /// bug, and the one this layer's routing exists to make impossible. The
-    /// two ledgers and the recogniser must agree exactly.
+    /// bug. And a slot in `fed_slots` that the recogniser has quietly dropped
+    /// is the stuck-contact bug: the grab would never uninstall. Checking
+    /// equality rather than containment catches both, and checking per frame
+    /// rather than at the end of a test names the frame it went wrong on.
     fn check_routing(&self) {
         let mut in_recogniser: BTreeSet<u32> = BTreeSet::new();
         for (slot, _) in self.rec.contacts() {
             in_recogniser.insert(slot.id());
         }
-        let owned: BTreeSet<u32> = self.compositor_slots.clone();
         assert_eq!(
-            in_recogniser, owned,
+            in_recogniser, self.fed_slots,
             "routing leak: the recogniser is tracking {in_recogniser:?} but the \
-             compositor owns {owned:?}"
+             harness fed it {:?}",
+            self.fed_slots
         );
+    }
+
+    /// The slots the recogniser is holding, for direct assertion in a test.
+    fn recogniser_contacts(&self) -> BTreeSet<u32> {
+        self.rec.contacts().map(|(s, _)| s.id()).collect()
     }
 
     /// The device went away. Everything is torn down at once.
@@ -287,7 +285,8 @@ impl Harness {
         // `completed: false`, so a yanked device never fires a bound action.
         self.events.extend(self.rec.reset());
         self.client_slots.clear();
-        self.compositor_slots.clear();
+        self.fed_slots.clear();
+        self.positions.clear();
         closed
     }
 
@@ -316,7 +315,7 @@ impl Harness {
         self.seat.open.is_empty()
             && self.arb.open_client_touches() == 0
             && self.client_slots.is_empty()
-            && self.compositor_slots.is_empty()
+            && self.fed_slots.is_empty()
             && !self.rec.is_active()
     }
 }
@@ -761,7 +760,7 @@ fn out_of_order_lift_leaves_no_stuck_slots() {
         "out-of-order lift left state behind: seat={:?} client={:?} comp={:?}",
         h.seat.open,
         h.client_slots,
-        h.compositor_slots
+        h.fed_slots
     );
     // The gesture itself completed normally before the lifts — out-of-order
     // lifting is not a reason to withhold a bound action, only a reason not to
@@ -1017,89 +1016,111 @@ fn exclusion_rect_forwards_touches() {
     assert!(h.is_clean());
 }
 
-// ── the seam, demonstrated ────────────────────────────────────────────────
+// ── the retro-fed contacts, through the whole sequence ────────────────────
 
-/// The compositional defect this suite was built to find, kept as a
-/// regression-shaped test rather than a note in a commit message.
+/// The contacts cancelled at the arming must stay tracked for the *whole*
+/// sequence, not just at the down.
 ///
-/// [`Feed::OnlyNewlyArmedSlots`] is how `TouchArbitrationGrab` routes today:
-/// `route_down` feeds `recognizer.down` only for slots in `compositor_slots`,
-/// and the two slots cancelled by `clear_clients()` at the arming are in
-/// neither set afterwards. They are still physically on the glass, so the
-/// gesture the compositor took is three contacts wide but the recogniser only
-/// ever sees one — and with `min_fingers` at 2, no three-finger swipe can ever
-/// be recognised.
+/// This is the second half of the composition seam, and it is a distinct bug
+/// from the first. When the third finger arms, slots 0 and 1 are handed back
+/// by `clear_clients()` and closed on the seat — which stops them being
+/// phantoms, and stops them being the *client's*. It does not lift them off
+/// the glass: all three contacts are still down, and all three belong to the
+/// gesture the compositor just took.
 ///
-/// So gate item 1 passes on [`Feed::GestureTakesTheWholeSequence`] and this
-/// test documents the other side of the seam. That is the whole point of the file: ownership and recognition were
-/// both individually green, and the composition was still broken.
-///
-/// The fix is in the adapter, not in these crates: the grab must feed the
-/// recogniser every contact of the sequence it has taken, including the ones
-/// it cancelled at the seat. When that lands, this test should be deleted
-/// along with the `Feed` enum, because there will be one behaviour left.
+/// Feeding them at the down is only half a fix. If `motion` and `up` are then
+/// gated on the routing sets instead of on what the recogniser actually
+/// holds, the retro-fed contacts are frozen for the rest of the sequence:
+/// they never move, never lift, the grab never uninstalls, and the stuck
+/// contacts poison the next gesture. So this asserts the down, the motion and
+/// the lift separately, and asserts the recogniser's contact set is *empty*
+/// at the end rather than merely smaller — a leak of exactly one contact is
+/// the whole bug.
 #[test]
-fn known_defect_arming_does_not_feed_the_cancelled_contacts_to_the_recogniser() {
-    let mut h = Harness::with_feed(Policy::default(), Feed::OnlyNewlyArmedSlots);
+fn retro_fed_contacts_keep_tracking_through_motion_and_lift() {
+    let mut h = Harness::new(Policy::default());
 
     for (i, slot) in [0u32, 1, 2].into_iter().enumerate() {
         h.down(slot, centre(40.0 * i as f64), false, false, at(0));
     }
     h.frame(at(0));
-    drag_left(&mut h, &[0, 1, 2], 15, 600.0);
-    for slot in 0..3u32 {
-        h.up(slot);
-    }
-    h.frame(at(400));
 
-    // Arbitration is correct even here — this is not an L3 bug.
+    // (1) All three are tracked, including the two just cancelled at the seat.
     assert_eq!(
-        h.ownership,
-        vec![Ownership::Client, Ownership::Client, Ownership::Compositor]
+        h.recogniser_contacts(),
+        BTreeSet::from([0, 1, 2]),
+        "arming must feed the whole sequence to the recogniser"
     );
     assert_eq!(h.cancels, vec![vec![0, 1]]);
-    assert_eq!(h.seat.open, BTreeSet::new(), "no phantom touch either");
-
-    // But the recogniser only ever saw the arming contact, so the three-wide
-    // gesture the compositor took was never recognisable in the first place.
+    assert_eq!(h.seat.open, BTreeSet::new(), "and close the client half");
     assert!(
-        h.completed().is_empty(),
-        "the gesture the compositor took was never recognised: {:?}",
+        h.client_slots.is_empty(),
+        "the cancelled contacts are no longer the client's"
+    );
+
+    // (2) Motion for each of the three advances the gesture. A frozen contact
+    // cannot produce this: with the contacts stuck at their start positions
+    // the centroid never travels, so the recogniser never *begins* a swipe.
+    // Checking at the `Begin` rather than waiting for the `End` is what makes
+    // this a motion assertion — the `End` only arrives at the lift, so a check
+    // there would not distinguish "moved" from "lifted".
+    drag_left(&mut h, &[0, 1, 2], 15, 600.0);
+
+    assert!(
+        h.events
+            .iter()
+            .any(|e| matches!(e, GestureEvent::Begin(Gesture::Swipe { fingers: 3, .. }))),
+        "motion must advance the gesture to a three-finger swipe; got {:?}",
         h.events
     );
-}
+    assert!(
+        h.events
+            .iter()
+            .any(|e| matches!(e, GestureEvent::Update(Gesture::Swipe { progress, .. }) if *progress > 0.0)),
+        "and must keep reporting progress; a frozen contact reports none"
+    );
 
-/// Sanity check on the harness itself: with the seam fixed, the same trace
-/// does produce a completed swipe. Without this, a reader could dismiss
-/// [`three_finger_mid_screen_swipe_arms_and_produces_a_workspace_swipe`]'s
-/// failure as "the recogniser needs more travel" rather than "the adapter
-/// feeds it the wrong contacts".
-#[test]
-fn the_same_trace_recognises_once_the_whole_sequence_is_fed() {
-    let mut h = Harness::with_feed(Policy::default(), Feed::GestureTakesTheWholeSequence);
-    for (i, slot) in [0u32, 1, 2].into_iter().enumerate() {
-        h.down(slot, centre(40.0 * i as f64), false, false, at(0));
-    }
-    h.frame(at(0));
-    drag_left(&mut h, &[0, 1, 2], 15, 600.0);
-    for slot in 0..3u32 {
+    // (3) An up for each of the three removes that one. Asserting per-slot is
+    // the point: a bug that leaks exactly one contact is invisible to a check
+    // made only at the end.
+    for (lifted, slot) in [0u32, 1, 2].into_iter().enumerate() {
         h.up(slot);
+        assert_eq!(
+            h.recogniser_contacts(),
+            ((lifted + 1) as u32..3).collect::<BTreeSet<u32>>(),
+            "slot {slot} must leave the recogniser on its own up"
+        );
     }
     h.frame(at(400));
 
-    assert_eq!(h.rec.contacts().count(), 0, "all lifted");
+    // And the lift closes the swipe, with real travel behind it.
+    let (fingers, delta) = h
+        .events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            GestureEvent::End {
+                gesture: Gesture::Swipe { fingers, delta, .. },
+                completed: true,
+            } => Some((*fingers, *delta)),
+            _ => None,
+        })
+        .expect("the lift must close the swipe");
+    assert_eq!(fingers, 3);
     assert!(
-        h.completed().iter().any(|g| matches!(
-            g,
-            Gesture::Swipe {
-                fingers: 3,
-                direction: SwipeDirection::Left,
-                ..
-            }
-        )),
-        "fed the whole sequence, got {:?}",
-        h.completed()
+        delta > 0.0,
+        "the swipe travelled {delta} px; a frozen contact reports 0"
     );
+
+    // (4) Empty, not merely smaller.
+    assert_eq!(
+        h.recogniser_contacts(),
+        BTreeSet::new(),
+        "the recogniser must hold nothing once every finger is up"
+    );
+    assert_eq!(h.fed_slots, BTreeSet::new(), "so the grab would unset");
+    assert!(!h.rec.is_active(), "and no gesture is left open");
+    assert!(h.is_clean());
 }
 
 /// The harness must actually be wired to both stacks, or every gate above is
