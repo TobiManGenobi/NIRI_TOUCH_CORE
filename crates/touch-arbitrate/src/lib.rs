@@ -1205,4 +1205,78 @@ mod tests {
         // New downs do see the new policy.
         assert_eq!(arb.down(1, &finger()), Ownership::Client);
     }
+
+    /// The stale-ledger regression.
+    ///
+    /// An arbitrator outlives individual sequences when the caller keeps it
+    /// as a long-lived ledger (the compositor adapter does exactly that, so
+    /// that a later finger can arm a sequence whose earlier fingers already
+    /// went to the client). That makes retirement the load-bearing
+    /// obligation: a slot recorded by `down` and never retired by `up`
+    /// inflates the arming tally forever, and the next unrelated touch
+    /// anywhere can arm the compositor out of nowhere.
+    ///
+    /// This is the seat-free statement of that invariant. It pins both
+    /// halves, because either one alone can pass while the bug is live: the
+    /// ledger must be empty afterwards, *and* an unrelated single finger
+    /// must not arm. A ledger that leaks a compositor-owned slot fails the
+    /// first; one that leaks only client slots fails the second.
+    #[test]
+    fn a_full_down_up_cycle_leaves_no_slots_and_does_not_arm_a_later_finger() {
+        let mut arb = Arbitrator::new(Policy::default());
+
+        // Three plain fingers on the middle of a surface: the first two go
+        // to the client, the third arms the sequence. This is the shape that
+        // creates client slots, which are the ones that inflate the tally.
+        assert_eq!(arb.down(10, &finger()), Ownership::Client);
+        assert_eq!(arb.down(11, &finger()), Ownership::Client);
+        assert_eq!(arb.down(12, &finger()), Ownership::Compositor);
+        assert_eq!(arb.open_client_touches(), 2);
+
+        // Every finger lifts, each returning the ownership it actually had.
+        assert_eq!(arb.up(10), Some(Ownership::Client));
+        assert_eq!(arb.up(11), Some(Ownership::Client));
+        assert_eq!(arb.up(12), Some(Ownership::Compositor));
+        for slot in [10, 11, 12] {
+            assert_eq!(arb.ownership(slot), None, "slot {slot} still tracked after up");
+        }
+
+        // The ledger is empty.
+        assert_eq!(arb.open_client_touches(), 0);
+        assert_eq!(arb.ownership(10), None);
+        assert_eq!(arb.ownership(11), None);
+        assert_eq!(arb.ownership(12), None);
+
+        // And the tally really is back to zero: an unrelated single finger,
+        // far away on a different surface, must go to the client rather than
+        // arming on the strength of a sequence that ended.
+        let elsewhere = DownContext {
+            pos: Point::new(-9000.0, -9000.0),
+            ..DownContext::default()
+        };
+        assert_eq!(arb.down(1, &elsewhere), Ownership::Client);
+        assert_eq!(arb.up(1), Some(Ownership::Client));
+        assert_eq!(arb.open_client_touches(), 0);
+    }
+
+    /// The same invariant after the device-removal teardown, which ends a
+    /// sequence without naming its slots.
+    #[test]
+    fn clear_leaves_the_ledger_able_to_be_reused_without_arming() {
+        let mut arb = Arbitrator::new(Policy::default());
+        arb.down(10, &finger());
+        arb.down(11, &finger());
+        assert_eq!(arb.open_client_touches(), 2);
+
+        // Device removal: `clear` reports the client touches the caller must
+        // close, and leaves nothing behind.
+        assert_eq!(arb.clear(), 2);
+        assert_eq!(arb.open_client_touches(), 0);
+
+        // Reuse: a fresh single finger must not inherit the old sequence.
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(arb.up(1), Some(Ownership::Client));
+        assert_eq!(arb.open_client_touches(), 0);
+    }
+
 }
