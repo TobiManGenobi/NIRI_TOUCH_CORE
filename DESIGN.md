@@ -223,25 +223,44 @@ PR 3 (L1) has no dependency on that answer, which is why it goes first.
 | 1, 2 — config grammar | blocked on the [niri-wm/niri#3771][pr3771] check above |
 
 `crates/touch-core` carries both lower layers: **70 tests, clippy clean,
-zero dependencies**. `crates/touch-arbitrate` adds L3: **98 tests total**,
+zero dependencies**. `crates/touch-arbitrate` adds L3: **107 tests total**,
 one dependency (touch-core), still no clock and no smithay.
 
 L3 answers the question the other two layers leave open: *who owns this
 touch?* One `Ownership` enum (`Compositor` / `Client` / `Ignored`), one
-transition function `decide(ctx, policy, compositor_owned_in_sequence)`, and
-one ledger `Arbitrator` that records ownership per slot. The precedence
-chain is documented as a contract in `decide`'s doc comment and mirrors
+transition function `decide(ctx, policy, seq: SequenceState)`, and one
+ledger `Arbitrator` that records ownership per slot. The precedence chain
+is documented as a contract in `decide`'s doc comment and mirrors
 niri-touch's edge > Mod > passthrough ordering; the pen and eraser rules
 and the rect exclusion layer on top of it.
 
-The invariant patch `0011` is about is enforced as an API contract rather
-than a comment: `Arbitrator::clear()` *returns* the number of
-client-visible touches the caller must close, and `open_client_touches()`
-makes that number checkable without a seat. A test asserts
-`clear() == open_client_touches()` before teardown. Pen and eraser slots
-are tracked in a separate set so a resting stylus can never arm the
-compositor's gesture recogniser for the next finger — the bug that would
-present as random gesture activation.
+**Arming, step 8.** The first cut of L3 had a hole that only surfaced when
+the adapter was wired up: a multi-finger swipe in the *middle* of the
+screen could never arm. Finger 1 on a plain surface is the client's (no
+zone, no Mod, no passthrough app), so nothing in the sequence was
+compositor-owned, so finger 2 was the client's too, and so was finger 3. The
+recogniser never saw a sequence it could arm on and `bind Swipe fingers=3`
+silently never fired away from the edges — only zone-starts and Mod-starts
+worked at all. `Policy::min_gesture_fingers` (default 3) fixes it: fingers
+accumulate on a plain surface and the Nth arms the sequence, which is the
+Android and niri-tablet model. It sits below every escape-hatch rule, so a
+rect, a window rule or a held Mod still outranks a bare finger count.
+
+Arming is also the one transition that takes touches *back*: fingers 1 and
+2 were already forwarded when finger 3 arms. `Arbitrator::clear_clients()`
+returns exactly those slots for the caller to cancel, and
+`client_slots()` exposes them without consuming them. `clear()` stays as
+the device-removal teardown — it takes everything and returns a count,
+because a device that no longer exists has nothing left to deliver to.
+Both together are the patch `0011` invariant as an API contract rather than
+a comment: the numbers are returned, they are computable without a seat,
+and they are asserted in tests.
+
+Only plain-surface fingers count toward arming. A pen tip is a tool, a
+contact inside an exclusion rect is one the client asked us to leave
+alone, and a passthrough window is one the user wants in full — letting any
+of those push the sequence over the threshold would grab exactly the
+touches that were most carefully protected.
 
 L1 currently provides: slot lifecycle (`down`/`motion`/`up`/`clear`), per-frame
 derived geometry (`centroid`, `centroid_delta`, `spread`, `rotation_delta`,

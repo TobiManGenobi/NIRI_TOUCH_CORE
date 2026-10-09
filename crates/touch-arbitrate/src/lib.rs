@@ -13,6 +13,19 @@
 //! └─────────────────────────────────────────────────────┘
 //! ```
 //!
+//! # Arming
+//!
+//! Ownership is not a per-contact constant. Fingers accumulate on a plain
+//! surface and the Nth one — [`Policy::min_gesture_fingers`], three by
+//! default — arms the gesture for the whole sequence. That is the Android
+//! and niri-tablet model, and it is why [`decide`] takes a
+//! [`SequenceState`] rather than a single boolean.
+//!
+//! Arming is also the only transition that takes touches *back*: fingers 1
+//! and 2 were already forwarded, so when finger 3 arms, the caller must
+//! cancel those two client touches via [`Arbitrator::clear_clients`] or it has
+//! manufactured the phantom touches patch `0011` describes.
+//!
 //! # Why this is the interesting layer
 //!
 //! Neither fork shipped an ownership *model*. niri-touch derived ownership
@@ -48,9 +61,15 @@
 #![warn(missing_docs)]
 pub use touch_core::Point;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use touch_core::Zone;
+
+/// How many plain-surface fingers arm a gesture by default.
+///
+/// Three is the Android and niri-tablet convention, and the count that
+/// `bind Swipe fingers=3` in `DESIGN.md` assumes.
+pub const DEFAULT_MIN_GESTURE_FINGERS: u32 = 3;
 
 /// Which layer owns a single touch contact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +109,30 @@ pub struct DownContext {
     pub pos: Point,
     /// The contact landed inside an advertised exclusion rect.
     pub in_exclusion_rect: bool,
+}
+
+impl DownContext {
+    /// Whether this contact counts toward arming a gesture once the
+    /// sequence reaches [`Policy::min_gesture_fingers`].
+    ///
+    /// The rule is deliberately narrow: **only plain-surface fingers
+    /// count.** A pen tip is a tool, not a finger; a contact inside a
+    /// client-advertised exclusion rect is one the client explicitly asked
+    /// the compositor not to interfere with; a contact on a
+    /// `touchscreen-gesture-passthrough` window is one the user has told us
+    /// this app wants in full. Letting any of those push the sequence over
+    /// the arming threshold would let the compositor grab touches it was
+    /// just told to leave alone, and would require cancelling exactly the
+    /// touches the client most carefully protected. Arming is a claim about
+    /// the user's intent on a bare surface, so it is made from bare
+    /// surfaces.
+    ///
+    /// `under_gesture_app` is checked without the zone caveat step 6 of
+    /// [`decide`] applies: a contact in a zone is decided at step 7 and
+    /// never reaches arming, so the two cases cannot disagree in practice.
+    pub fn counts_toward_arming(&self) -> bool {
+        !self.is_pen && !self.eraser && !self.in_exclusion_rect && !self.under_gesture_app
+    }
 }
 
 /// An axis-aligned rectangle in logical pixels, anchored at its top-left
@@ -134,7 +177,7 @@ impl Rect {
 }
 
 /// The configured arbitration policy.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     /// The kill switch. When set, every touch belongs to the client and the
     /// compositor never arms a gesture.
@@ -147,6 +190,33 @@ pub struct Policy {
     pub passthrough_apps: Vec<String>,
     /// Client-advertised gesture exclusion rects, in logical pixels.
     pub exclusion_rects: Vec<Rect>,
+    /// How many plain-surface fingers arm a gesture, counting the finger
+    /// that triggers the arm.
+    ///
+    /// Defaults to 3, the Android and niri-tablet convention: three fingers
+    /// is the smallest count that is not confused with a two-finger scroll or
+    /// a pinch, and it is what `bind Swipe fingers=3` expects.
+    ///
+    /// A value of 0 or 1 makes the compositor claim the first bare contact,
+    /// which is almost never what a config author wants; treat those as
+    /// "arming disabled" rather than as a request to take over single taps.
+    pub min_gesture_fingers: u32,
+}
+
+/// The default is [`DEFAULT_MIN_GESTURE_FINGERS`], not zero.
+///
+/// Written out rather than derived because the zero value of a `u32` is the
+/// dangerous one here: a derived `Default` would silently disable arming and
+/// reproduce exactly the bug this rule exists to fix.
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            passthrough_apps: Vec::new(),
+            exclusion_rects: Vec::new(),
+            min_gesture_fingers: DEFAULT_MIN_GESTURE_FINGERS,
+        }
+    }
 }
 
 impl Policy {
@@ -161,20 +231,43 @@ impl Policy {
     }
 }
 
+/// What the sequence already held, as seen by one arriving contact.
+///
+/// A single struct rather than a growing parameter list: [`decide`] needs to
+/// know both *whether anyone owns this sequence* and *how close it is to
+/// arming*, and both are properties of the same thing — the set of contacts
+/// currently down. Splitting them into two positional `bool`/`usize`
+/// arguments would let a caller transpose them silently, and would keep
+/// growing every time the arming rule needed one more fact about the
+/// sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SequenceState {
+    /// Some contact already down in this sequence belongs to the compositor.
+    pub compositor_owned: bool,
+    /// Contacts already down in this sequence that count toward arming.
+    ///
+    /// See [`DownContext::counts_toward_arming`] for exactly which contacts
+    /// qualify; the short version is that pen tips and contacts the client
+    /// asked to keep (exclusion rects, passthrough windows) are excluded.
+    pub arming_eligible: usize,
+}
+
 /// The single ownership transition function.
 ///
 /// # Precedence
 ///
-/// The order below is the contract. It is not an implementation detail and
-/// it is not free to change: it mirrors niri-touch's `touch_gesture.rs`
-/// lines 274–284, where edge zones and Mod are tested before the
-/// passthrough-app rule, and it layers the pen/eraser/tool rules and the
-/// rect exclusion on top in that same "tool identity first, Mod second,
-/// passthrough last" shape.
+/// The order below is the contract, and the numbered list is the whole
+/// specification: read it top to bottom and you have the function. Steps 1–7
+/// mirror niri-touch's `touch_gesture.rs` lines 274–284, where edge zones and
+/// Mod are tested before the passthrough-app rule, and layer the pen/eraser
+/// tool rules and the rect exclusion on top in that same "tool identity
+/// first, Mod second, passthrough last" shape. Step 8 is new here and
+/// carries the arming rule that neither prior fork had.
 ///
 /// 1. [`Policy::disabled`] → [`Ownership::Client`]. The kill switch outranks
-///    everything, including Mod and zones. Touch must never be able to wedge
-///    a session, so the escape hatch has to outrank the escape hatches.
+///    everything, including Mod, zones and arming. Touch must never be able
+///    to wedge a session, so the escape hatch has to outrank the escape
+///    hatches.
 /// 2. `is_pen && !mod_down` → [`Ownership::Client`]. A stylus drawing must
 ///    not arm a multi-finger gesture; Mod is how the user says "no, treat
 ///    this as a gesture" (barrel button).
@@ -191,12 +284,48 @@ impl Policy {
 ///    **not** apply inside a zone.
 /// 7. [`DownContext::zone`] present → [`Ownership::Compositor`]. Zones beat
 ///    passthrough apps: an edge swipe from inside a drawing app is the
-///    escape hatch for "this app swallowed my gestures".
-/// 8. Otherwise, fall through to sequence ownership:
+///    escape hatch for "this app swallowed my gestures". A zone arms on the
+///    very first finger, with no threshold to cross.
+/// 8. **Arming.** If this contact counts toward arming (see
+///    [`DownContext::counts_toward_arming`]) and the sequence already holds at
+///    least `policy.min_gesture_fingers - 1` such contacts, the threshold is
+///    reached → [`Ownership::Compositor`].
+///    Placed immediately before the fallthrough, and below every
+///    escape-hatch rule, for two reasons. It is a claim about user intent
+///    made from nothing but a count of bare fingers on a plain surface, so
+///    it must lose to anything explicit — a Mod held, a rect, a window
+///    rule. And it must lose to step 7, because a zone-starting swipe that
+///    waited for a third finger would be unusable: edge swipes are
+///    single-finger by nature.
+/// 9. Otherwise, fall through to sequence ownership:
 ///    [`Ownership::Compositor`] if the sequence already has a
 ///    compositor-owned contact, else [`Ownership::Client`].
 ///
-/// Step 8 is the documented last case, and the chain is exhaustive in the
+/// # Why step 8 exists
+///
+/// Without it, a multi-finger swipe in the *middle* of the screen can never
+/// arm, and the hole is not obvious: finger 1 lands on a plain surface with
+/// no zone, no Mod and no passthrough app, so step 9 hands it to the client.
+/// Nothing in the ledger is then compositor-owned, so finger 2 is also the
+/// client's, and so is finger 3. The recogniser above never sees a sequence
+/// it could arm on, and `bind Swipe fingers=3` silently never fires away from
+/// the edges. Only zone-starts and Mod-starts would ever work. Step 8 is the
+/// Android and niri-tablet model: fingers accumulate, and the Nth finger
+/// arms the gesture.
+///
+/// # Arming is the one arm that changes a live slot's owner
+///
+/// Steps 1–7 and 9 are all decided by facts that were true *before* this
+/// contact landed, so they are stable across a sequence. Step 8 is not: when
+/// the third finger arms, fingers 1 and 2 have already been forwarded to the
+/// client. Those are client-visible touches the compositor is now taking
+/// away, and they must be cancelled at the client or they become exactly the
+/// phantom touches niri-tablet patch `0011` describes. That is why
+/// [`Arbitrator::clear_clients`] exists, and why a caller must invoke it the
+/// moment [`decide`] returns [`Ownership::Compositor`] by arming — see its
+/// docs.
+///
+/// Step 9 is the documented last case, and the chain is exhaustive in the
 /// sense that matters: every path returns a value, and the fallthrough is
 /// stated here rather than being an implicit tail of the function. A
 /// `match` was rejected deliberately — the guards are read top-to-bottom as
@@ -212,7 +341,7 @@ impl Policy {
 /// from here — dropping a contact is the caller's decision, made after this
 /// function returns, so that a device-level ignore policy never silently
 /// becomes a gesture-stack behaviour.
-pub fn decide(ctx: &DownContext, policy: &Policy, compositor_owned_in_sequence: bool) -> Ownership {
+pub fn decide(ctx: &DownContext, policy: &Policy, seq: SequenceState) -> Ownership {
     // 1. Kill switch outranks everything.
     if policy.disabled {
         return Ownership::Client;
@@ -237,49 +366,75 @@ pub fn decide(ctx: &DownContext, policy: &Policy, compositor_owned_in_sequence: 
     if ctx.under_gesture_app && ctx.zone.is_none() {
         return Ownership::Client;
     }
-    // 7. A zone is the compositor's territory.
+    // 7. A zone is the compositor's territory, from the very first finger.
     if ctx.zone.is_some() {
         return Ownership::Compositor;
     }
-    // 8. Documented fallthrough: inherit sequence ownership.
-    if compositor_owned_in_sequence {
+    // 8. Arming: this finger brings the sequence up to min_gesture_fingers.
+    // The `>= 2` guard means a configured threshold of 0 or 1 disables
+    // arming rather than claiming every bare single-finger tap.
+    if policy.min_gesture_fingers >= 2
+        && ctx.counts_toward_arming()
+        && seq.arming_eligible >= (policy.min_gesture_fingers - 1) as usize
+    {
+        return Ownership::Compositor;
+    }
+    // 9. Documented fallthrough: inherit sequence ownership.
+    if seq.compositor_owned {
         Ownership::Compositor
     } else {
         Ownership::Client
     }
 }
 
+/// What the ledger remembers about one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotRecord {
+    ownership: Ownership,
+    /// Snapshot of [`DownContext::counts_toward_arming`] at the down.
+    counts_toward_arming: bool,
+    /// Whether the contact was a pen or eraser tip.
+    ///
+    /// Kept separately from `counts_toward_arming` because the two answer
+    /// different questions. A pen tip never counts toward arming *and* never
+    /// counts toward the compositor-owned tally in step 9 — a stylus resting
+    /// on the glass must not silently arm the recogniser for the next
+    /// finger, which would present to the user as random gesture
+    /// activation.
+    pen: bool,
+}
+
 /// The per-seat ownership ledger.
 ///
-/// [`decide`] is the rule; this is the bookkeeping the rule needs. It
-/// tracks which slots are down and who owns each, so that
-/// sequence ownership (step 8 of [`decide`]) and device-removal teardown
-/// work without a live seat — the two things niri-tablet needed patches
-/// `0010` and `0012` for.
+/// [`decide`] is the rule; this is the bookkeeping the rule needs. It tracks
+/// which slots are down and who owns each, so that arming (step 8 of
+/// [`decide`]), sequence ownership (step 9) and both flavours of teardown
+/// work without a live seat — the things niri-tablet needed patches `0010`,
+/// `0011` and `0012` for.
 ///
 /// # The invariant
 ///
 /// **A client-visible touch is never left open when a gesture grab
-/// installs.** [`clear`] returns the number of slots it dropped that the
-/// client had been given a down for; the caller must close exactly that many
-/// client-visible touch points. Skipping the close leaves the phantom
-/// touches niri-tablet patch `0011` describes — a browser pinch-zooming from
-/// one finger and ignoring every later tap, up to nine phantoms at once.
-/// The count is the contract, not a comment: it is returned, it is
-/// computable without a seat via [`Arbitrator::open_client_touches`], and it
-/// is asserted in tests.
+/// installs.** There are two ways the compositor takes touches back, and
+/// each has its own teardown:
+///
+/// - **Arming** takes back only the contacts it needs to reclaim, leaving
+///   compositor-owned contacts untouched. That is
+///   [`clear_clients`], and it returns the slots to cancel.
+/// - **Device removal** takes back everything, device gone or not. That is
+///   [`clear`], and it returns a count.
+///
+/// Both are the niri-tablet patch `0011` invariant expressed as an API
+/// contract rather than a comment. Skipping the close leaves the phantom
+/// touches that patch describes — a browser pinch-zooming from one finger
+/// and ignoring every later tap, up to nine phantoms at once. The numbers
+/// are returned rather than asserted in a comment, they are computable
+/// without a seat via [`Arbitrator::client_slots`] and
+/// [`Arbitrator::open_client_touches`], and they are asserted in tests.
 #[derive(Debug, Clone)]
 pub struct Arbitrator {
     policy: Policy,
-    slots: BTreeMap<u32, Ownership>,
-    /// Slots that came from a pen or eraser.
-    ///
-    /// Tracked separately because a pen contact is *always* the client's (see
-    /// [`decide`] steps 2 and 3). If such a slot counted toward the
-    /// compositor-owned tally in step 8, a resting stylus on the glass would
-    /// silently arm the compositor's gesture recogniser for the next finger —
-    /// a bug that would look like random gesture activation.
-    pen_slots: BTreeSet<u32>,
+    slots: BTreeMap<u32, SlotRecord>,
 }
 
 impl Arbitrator {
@@ -288,7 +443,6 @@ impl Arbitrator {
         Self {
             policy,
             slots: BTreeMap::new(),
-            pen_slots: BTreeSet::new(),
         }
     }
 
@@ -311,21 +465,47 @@ impl Arbitrator {
     /// entry, which is correct: libinput reuses slot ids after a finger
     /// lifts, and a down for a slot we believe is still down is a desync we
     /// resolve in favour of the newest event.
+    ///
+    /// When this returns [`Ownership::Compositor`] *because the sequence
+    /// armed* — that is, when the contact had no zone and no Mod and reached
+    /// `min_gesture_fingers` on plain surface alone — the caller must
+    /// immediately call [`clear_clients`] and cancel the returned slots at
+    /// the client. See the type-level invariant.
     pub fn down(&mut self, slot: u32, ctx: &DownContext) -> Ownership {
-        let compositor_owned_in_sequence = self
-            .slots
-            .iter()
-            .filter(|(s, _)| !self.pen_slots.contains(s))
-            .any(|(_, o)| *o == Ownership::Compositor);
+        let seq = self.sequence_state(ctx);
+        let ownership = decide(ctx, &self.policy, seq);
 
-        let ownership = decide(ctx, &self.policy, compositor_owned_in_sequence);
-
-        if ctx.is_pen || ctx.eraser {
-            self.pen_slots.insert(slot);
-        }
-        self.slots.insert(slot, ownership);
+        self.slots.insert(
+            slot,
+            SlotRecord {
+                ownership,
+                counts_toward_arming: ctx.counts_toward_arming(),
+                pen: ctx.is_pen || ctx.eraser,
+            },
+        );
 
         ownership
+    }
+
+    /// The [`SequenceState`] an arriving `ctx` would be judged against.
+    ///
+    /// Public so a caller that wants to predict or log the decision without
+    /// mutating the ledger can ask the same question [`decide`] will ask,
+    /// rather than reimplementing the tally and getting it subtly wrong.
+    pub fn sequence_state(&self, _ctx: &DownContext) -> SequenceState {
+        SequenceState {
+            // Pen and eraser contacts are excluded: a stylus resting on the
+            // glass must never make the next finger inherit Compositor.
+            compositor_owned: self
+                .slots
+                .values()
+                .any(|r| !r.pen && r.ownership == Ownership::Compositor),
+            arming_eligible: self
+                .slots
+                .values()
+                .filter(|r| r.counts_toward_arming)
+                .count(),
+        }
     }
 
     /// Record a touch-up and return the ownership it had, if it was tracked.
@@ -334,27 +514,63 @@ impl Arbitrator {
     /// gets `None` here has an untracked slot, which is a desync worth
     /// logging but not worth asserting on mid-gesture.
     pub fn up(&mut self, slot: u32) -> Option<Ownership> {
-        self.pen_slots.remove(&slot);
-        self.slots.remove(&slot)
+        self.slots.remove(&slot).map(|r| r.ownership)
     }
 
     /// The recorded ownership of `slot`, if it is currently down.
     pub fn ownership(&self, slot: u32) -> Option<Ownership> {
-        self.slots.get(&slot).copied()
+        self.slots.get(&slot).map(|r| r.ownership)
+    }
+
+    /// The slots currently down that belong to the client, ascending.
+    ///
+    /// The slots [`clear_clients`] would cancel. Exposed so a caller can
+    /// assert the arming invariant before it acts: after a three-finger
+    /// swipe arms, exactly the first two slots must appear here.
+    pub fn client_slots(&self) -> Vec<u32> {
+        self.slots
+            .iter()
+            .filter(|(_, r)| r.ownership == Ownership::Client)
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
+    /// Drop every client-owned slot, returning the slots to cancel.
+    ///
+    /// This is the **arming** teardown: the sequence just reached
+    /// `min_gesture_fingers`, the compositor is taking the gesture back, and
+    /// the contacts it had forwarded so far must be cancelled at the client
+    /// or they become phantom touches (niri-tablet patch `0011`). Each
+    /// returned slot is one touch point the caller must close — so the
+    /// caller does not have to count anything, which is the point of
+    /// returning them rather than returning a `usize`.
+    ///
+    /// Compositor-owned contacts are left alone: the gesture is still live,
+    /// and only the client's half is being retracted. A pen slot *is* the
+    /// client's, so it is cancelled along with the rest — it was forwarded
+    /// in the first place. Compare [`clear`], the device-removal teardown,
+    /// which takes compositor-owned contacts too, because a device that no
+    /// longer exists has nothing left to deliver them to.
+    pub fn clear_clients(&mut self) -> Vec<u32> {
+        let slots = self.client_slots();
+        for slot in &slots {
+            self.slots.remove(slot);
+        }
+        slots
     }
 
     /// Drop every slot, returning how many client-visible touches the caller
     /// must close.
     ///
-    /// This is the device-removal / gesture-grab path: `touch_end` in
-    /// `wl_touch` terms, or the teardown when a gesture grab installs over
-    /// contacts the client already has. See the type-level invariant — the
-    /// returned count is exactly the number of client-owned slots dropped,
-    /// and the caller owes exactly that many touch-point closes.
+    /// This is the **device-removal** teardown — `touch_end` in `wl_touch`
+    /// terms, or a device yanked mid-gesture — and unlike
+    /// [`clear_clients`] it takes compositor-owned contacts too, because
+    /// there is no device left to deliver anything. The returned count is
+    /// exactly the number of client-owned slots dropped, and the caller owes
+    /// exactly that many touch-point closes.
     pub fn clear(&mut self) -> usize {
         let closed = self.open_client_touches();
         self.slots.clear();
-        self.pen_slots.clear();
         closed
     }
 
@@ -364,8 +580,8 @@ impl Arbitrator {
     /// without having to call [`clear`] first.
     pub fn open_client_touches(&self) -> usize {
         self.slots
-            .iter()
-            .filter(|(_, o)| **o == Ownership::Client)
+            .values()
+            .filter(|r| r.ownership == Ownership::Client)
             .count()
     }
 }
@@ -401,8 +617,21 @@ mod tests {
             mod_down: true,
             ..finger()
         };
-        assert_eq!(decide(&ctx, &policy, false), Ownership::Client);
-        assert_eq!(decide(&ctx, &policy, true), Ownership::Client);
+        assert_eq!(
+            decide(&ctx, &policy, SequenceState::default()),
+            Ownership::Client
+        );
+        assert_eq!(
+            decide(
+                &ctx,
+                &policy,
+                SequenceState {
+                    compositor_owned: true,
+                    ..SequenceState::default()
+                }
+            ),
+            Ownership::Client
+        );
     }
 
     #[test]
@@ -411,7 +640,10 @@ mod tests {
             is_pen: true,
             ..finger()
         };
-        assert_eq!(decide(&ctx, &Policy::default(), false), Ownership::Client);
+        assert_eq!(
+            decide(&ctx, &Policy::default(), SequenceState::default()),
+            Ownership::Client
+        );
         // Even mid-sequence, and even in a zone.
         assert_eq!(
             decide(
@@ -420,7 +652,10 @@ mod tests {
                     ..ctx
                 },
                 &Policy::default(),
-                true
+                SequenceState {
+                    compositor_owned: true,
+                    ..SequenceState::default()
+                }
             ),
             Ownership::Client
         );
@@ -434,7 +669,7 @@ mod tests {
             ..finger()
         };
         assert_eq!(
-            decide(&ctx, &Policy::default(), false),
+            decide(&ctx, &Policy::default(), SequenceState::default()),
             Ownership::Compositor
         );
     }
@@ -446,7 +681,10 @@ mod tests {
             mod_down: true,
             ..finger()
         };
-        assert_eq!(decide(&ctx, &Policy::default(), false), Ownership::Client);
+        assert_eq!(
+            decide(&ctx, &Policy::default(), SequenceState::default()),
+            Ownership::Client
+        );
     }
 
     #[test]
@@ -463,7 +701,7 @@ mod tests {
             ..finger()
         };
         assert_eq!(
-            decide(&ctx, &policy, false),
+            decide(&ctx, &policy, SequenceState::default()),
             Ownership::Compositor,
             "Mod is the escape hatch and outranks every heuristic"
         );
@@ -488,7 +726,10 @@ mod tests {
             pos: p,
             ..finger()
         };
-        assert_eq!(decide(&ctx, &policy, false), Ownership::Client);
+        assert_eq!(
+            decide(&ctx, &policy, SequenceState::default()),
+            Ownership::Client
+        );
     }
 
     #[test]
@@ -503,7 +744,7 @@ mod tests {
             ..finger()
         };
         assert_eq!(
-            decide(&ctx, &policy, false),
+            decide(&ctx, &policy, SequenceState::default()),
             Ownership::Compositor,
             "edge swipes must stay reachable from a passthrough app"
         );
@@ -514,18 +755,28 @@ mod tests {
             zone: None,
             ..finger()
         };
-        assert_eq!(decide(&ctx, &policy, false), Ownership::Client);
+        assert_eq!(
+            decide(&ctx, &policy, SequenceState::default()),
+            Ownership::Client
+        );
     }
 
     #[test]
     fn sequence_ownership_is_the_documented_fallthrough() {
         // Nothing special about the contact: bare first finger, then a second.
         assert_eq!(
-            decide(&finger(), &Policy::default(), false),
+            decide(&finger(), &Policy::default(), SequenceState::default()),
             Ownership::Client
         );
         assert_eq!(
-            decide(&finger(), &Policy::default(), true),
+            decide(
+                &finger(),
+                &Policy::default(),
+                SequenceState {
+                    compositor_owned: true,
+                    ..SequenceState::default()
+                }
+            ),
             Ownership::Compositor
         );
     }
@@ -588,6 +839,240 @@ mod tests {
         }
     }
 
+    // ── arming, step 8 ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_third_plain_finger_arms_the_sequence() {
+        // The regression test for the hole that made mid-screen swipes
+        // impossible: with no zone, no Mod and no passthrough app, the first
+        // two fingers are the client's and the third takes the sequence.
+        let mut arb = Arbitrator::new(Policy::default());
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(arb.down(2, &finger()), Ownership::Compositor);
+        // And the fourth inherits, by step 9 rather than by arming.
+        assert_eq!(arb.down(3, &finger()), Ownership::Compositor);
+    }
+
+    #[test]
+    fn arming_waits_for_the_configured_threshold() {
+        let policy = Policy {
+            min_gesture_fingers: 4,
+            ..Policy::default()
+        };
+        let mut arb = Arbitrator::new(policy);
+        for slot in 0..3 {
+            assert_eq!(
+                arb.down(slot, &finger()),
+                Ownership::Client,
+                "finger {slot} is below the threshold"
+            );
+        }
+        assert_eq!(arb.down(3, &finger()), Ownership::Compositor);
+    }
+
+    #[test]
+    fn a_threshold_below_two_disables_arming() {
+        // 0 and 1 would otherwise claim every bare single-finger tap.
+        for min in [0u32, 1] {
+            let mut arb = Arbitrator::new(Policy {
+                min_gesture_fingers: min,
+                ..Policy::default()
+            });
+            assert_eq!(arb.down(0, &finger()), Ownership::Client);
+            assert_eq!(arb.down(1, &finger()), Ownership::Client);
+            assert_eq!(arb.down(2, &finger()), Ownership::Client);
+        }
+    }
+
+    #[test]
+    fn a_pen_contact_never_counts_toward_arming() {
+        // At the default threshold, two fingers plus a stylus is still two
+        // fingers, so the third finger is the one that arms — the stylus
+        // neither accelerated nor blocked anything.
+        let mut arb = Arbitrator::new(Policy::default());
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(
+            arb.down(
+                9,
+                &DownContext {
+                    is_pen: true,
+                    ..finger()
+                }
+            ),
+            Ownership::Client
+        );
+        assert_eq!(
+            arb.down(2, &finger()),
+            Ownership::Compositor,
+            "the pen did not count, so this is the third finger"
+        );
+
+        // The non-acceleration is only visible against a threshold the pen
+        // could have reached. At four, the third finger is still the
+        // client's because only two fingers are down; had the pen counted,
+        // this would already be the fourth contact and would have armed.
+        let mut arb = Arbitrator::new(Policy {
+            min_gesture_fingers: 4,
+            ..Policy::default()
+        });
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(
+            arb.down(
+                9,
+                &DownContext {
+                    is_pen: true,
+                    ..finger()
+                }
+            ),
+            Ownership::Client
+        );
+        assert_eq!(arb.down(2, &finger()), Ownership::Client);
+        assert_eq!(arb.down(3, &finger()), Ownership::Compositor);
+    }
+
+    #[test]
+    fn an_excluded_or_passthrough_contact_does_not_count_toward_arming() {
+        // The chosen semantics, stated as a test: only plain-surface fingers
+        // arm. A contact the client asked to keep must not be able to push a
+        // later bare finger over the threshold — doing so would require
+        // cancelling exactly the touches the client protected.
+        let policy = Policy {
+            passthrough_apps: vec!["org.kde.krita".to_string()],
+            ..Policy::default()
+        };
+        let mut arb = Arbitrator::new(policy);
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(
+            arb.down(
+                1,
+                &DownContext {
+                    in_exclusion_rect: true,
+                    ..finger()
+                }
+            ),
+            Ownership::Client
+        );
+        assert_eq!(
+            arb.down(
+                2,
+                &DownContext {
+                    under_gesture_app: true,
+                    ..finger()
+                }
+            ),
+            Ownership::Client
+        );
+        assert_eq!(
+            arb.down(3, &finger()),
+            Ownership::Client,
+            "one plain finger, one excluded, one passthrough: no arming"
+        );
+        assert_eq!(arb.down(4, &finger()), Ownership::Compositor);
+
+        // And the converse: a plain finger's own exclusion flag is what
+        // disqualifies it. The same slot with the flag cleared is a plain
+        // surface contact and does count.
+        assert!(finger().counts_toward_arming());
+        assert!(!DownContext {
+            in_exclusion_rect: true,
+            ..finger()
+        }
+        .counts_toward_arming());
+    }
+
+    #[test]
+    fn disabled_beats_arming_and_a_zone_arms_on_the_first_finger() {
+        let mut arb = Arbitrator::new(Policy {
+            disabled: true,
+            ..Policy::default()
+        });
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(
+            arb.down(2, &finger()),
+            Ownership::Client,
+            "the kill switch outranks arming"
+        );
+        assert_eq!(arb.down(3, &finger()), Ownership::Client);
+
+        let mut arb = Arbitrator::new(Policy::default());
+        let mut zoned = finger();
+        zoned.zone = zone();
+        assert_eq!(
+            arb.down(0, &zoned),
+            Ownership::Compositor,
+            "a zone arms on the first finger; edge swipes are single-finger"
+        );
+    }
+
+    #[test]
+    fn arming_cancels_the_client_touches_it_took_back() {
+        let mut arb = Arbitrator::new(Policy::default());
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(arb.down(2, &finger()), Ownership::Compositor);
+        assert_eq!(arb.down(3, &finger()), Ownership::Compositor);
+
+        assert_eq!(arb.client_slots(), vec![0, 1]);
+        assert_eq!(
+            arb.clear_clients(),
+            vec![0, 1],
+            "the two slots the client must be told to cancel"
+        );
+        assert_eq!(arb.open_client_touches(), 0);
+        // The live gesture survives: compositor slots are untouched.
+        assert_eq!(arb.ownership(2), Some(Ownership::Compositor));
+        assert_eq!(arb.ownership(3), Some(Ownership::Compositor));
+        // And a second call has nothing to do.
+        assert!(arb.clear_clients().is_empty());
+    }
+
+    #[test]
+    fn clear_clients_cancels_pen_slots_too() {
+        let mut arb = Arbitrator::new(Policy::default());
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(
+            arb.down(
+                9,
+                &DownContext {
+                    is_pen: true,
+                    ..finger()
+                }
+            ),
+            Ownership::Client
+        );
+        assert_eq!(arb.down(2, &finger()), Ownership::Compositor);
+
+        // The pen slot is the client's, so it is one of the touch points the
+        // client must be told to cancel — the same way it was forwarded in
+        // the first place.
+        assert_eq!(arb.clear_clients(), vec![0, 1, 9]);
+        assert_eq!(
+            arb.ownership(9),
+            None,
+            "and it leaves the ledger, so it cannot arm anything afterwards"
+        );
+        assert_eq!(arb.ownership(2), Some(Ownership::Compositor));
+    }
+
+    #[test]
+    fn clear_is_device_removal_and_takes_compositor_slots_too() {
+        let mut arb = Arbitrator::new(Policy::default());
+        assert_eq!(arb.down(0, &finger()), Ownership::Client);
+        assert_eq!(arb.down(1, &finger()), Ownership::Client);
+        assert_eq!(arb.down(2, &finger()), Ownership::Compositor);
+
+        // Device teardown: everything goes, and only the client half is owed
+        // a cancel.
+        assert_eq!(arb.clear(), 2);
+        assert_eq!(arb.ownership(2), None);
+        assert_eq!(arb.open_client_touches(), 0);
+    }
+
     // ── ledger ─────────────────────────────────────────────────────────
 
     #[test]
@@ -616,7 +1101,10 @@ mod tests {
             ..finger()
         };
         assert_eq!(arb.down(9, &pen), Ownership::Client);
-        assert!(arb.pen_slots.contains(&9));
+        assert!(
+            arb.slots.get(&9).is_some_and(|r| r.pen),
+            "the pen slot is remembered as a pen slot"
+        );
 
         // The stylus is down, but a finger arriving next must still see an
         // unowned sequence.
@@ -654,7 +1142,10 @@ mod tests {
 
         // And the ledger is empty afterwards, pen set included.
         assert_eq!(arb.open_client_touches(), 0);
-        assert!(arb.pen_slots.is_empty());
+        assert!(
+            arb.slots.values().all(|r| !r.pen),
+            "no pen slots survive a teardown"
+        );
         assert_eq!(arb.ownership(0), None);
         assert_eq!(arb.clear(), 0, "a second teardown owes nothing");
     }
@@ -669,7 +1160,10 @@ mod tests {
         assert_eq!(arb.down(4, &pen), Ownership::Client);
         assert_eq!(arb.ownership(4), Some(Ownership::Client));
         assert_eq!(arb.clear(), 1);
-        assert!(arb.pen_slots.is_empty());
+        assert!(
+            arb.slots.values().all(|r| !r.pen),
+            "no pen slots survive a teardown"
+        );
     }
 
     #[test]
