@@ -8,4 +8,4 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/touch-core"]
+members = ["crates/touch-core", "crates/touch-arbitrate"]

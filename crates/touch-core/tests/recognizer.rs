@@ -31,11 +31,15 @@ impl Harness {
     }
 
     fn down(&mut self, slot: u32, x: f64, y: f64, zone: Option<Zone>) {
-        self.r.down(Slot::new(slot), Point::new(x, y), zone, self.t());
+        self.r
+            .down(Slot::new(slot), Point::new(x, y), zone, self.t());
     }
 
     fn move_to(&mut self, slot: u32, x: f64, y: f64) {
-        assert!(self.r.motion(Slot::new(slot), Point::new(x, y)), "slot {slot}");
+        assert!(
+            self.r.motion(Slot::new(slot), Point::new(x, y)),
+            "slot {slot}"
+        );
     }
 
     fn up(&mut self, slot: u32) {
@@ -131,10 +135,7 @@ fn tap_reports_the_peak_finger_count() {
     for s in 0..4 {
         h.up(s);
     }
-    assert_eq!(
-        begin_of(h.frame()),
-        [Gesture::Tap { fingers: 4 }]
-    );
+    assert_eq!(begin_of(h.frame()), [Gesture::Tap { fingers: 4 }]);
 }
 
 #[test]
@@ -232,9 +233,14 @@ fn swipe_locks_left_and_tracks_progress() {
     h.drag_all(-120.0, 0.0);
     let last = h.log.last().copied().expect("update");
     match last {
-        GestureEvent::Update(Gesture::Swipe { delta, progress, .. }) => {
+        GestureEvent::Update(Gesture::Swipe {
+            delta, progress, ..
+        }) => {
             assert!((delta - 180.0).abs() < 1e-9, "delta {delta}");
-            assert!((progress - 180.0 / 300.0).abs() < 1e-9, "progress {progress}");
+            assert!(
+                (progress - 180.0 / 300.0).abs() < 1e-9,
+                "progress {progress}"
+            );
         }
         other => panic!("expected a swipe update, got {other:?}"),
     }
@@ -293,7 +299,9 @@ fn axis_locks_so_a_diagonal_drag_keeps_one_direction() {
         .log
         .iter()
         .filter_map(|e| match e {
-            GestureEvent::Update(Gesture::Swipe { direction, delta, .. }) => Some((*direction, *delta)),
+            GestureEvent::Update(Gesture::Swipe {
+                direction, delta, ..
+            }) => Some((*direction, *delta)),
             _ => None,
         })
         .collect();
@@ -373,7 +381,12 @@ fn pinch_out_is_recognised_and_tracks_spread() {
         .find(|g| matches!(g, Gesture::Pinch { .. }))
         .expect("pinch out should be recognised");
     match pinch {
-        Gesture::Pinch { direction, delta, fingers, .. } => {
+        Gesture::Pinch {
+            direction,
+            delta,
+            fingers,
+            ..
+        } => {
             assert_eq!(direction, PinchDirection::Out);
             assert_eq!(fingers, 2);
             assert!(delta > 0.0, "diverging means positive spread delta");
@@ -399,7 +412,9 @@ fn pinch_in_is_the_mirror_image() {
         .find(|g| matches!(g, Gesture::Pinch { .. }))
         .expect("pinch in should be recognised");
     match pinch {
-        Gesture::Pinch { direction, delta, .. } => {
+        Gesture::Pinch {
+            direction, delta, ..
+        } => {
             assert_eq!(direction, PinchDirection::In);
             assert!(delta < 0.0);
         }
@@ -427,7 +442,13 @@ fn translation_beats_an_incidental_spread_change() {
         .copied()
         .unwrap_or_else(|| panic!("translation should win; began with {begins:?}"));
     assert!(
-        matches!(swipe, Gesture::Swipe { direction: SwipeDirection::Down, .. }),
+        matches!(
+            swipe,
+            Gesture::Swipe {
+                direction: SwipeDirection::Down,
+                ..
+            }
+        ),
         "expected a downward swipe, got {swipe:?}"
     );
 
@@ -437,7 +458,9 @@ fn translation_beats_an_incidental_spread_change() {
     h.advance(16);
     let evs = h.frame().to_vec();
     assert!(
-        !begin_of(&evs).iter().any(|g| matches!(g, Gesture::Pinch { .. })),
+        !begin_of(&evs)
+            .iter()
+            .any(|g| matches!(g, Gesture::Pinch { .. })),
         "a locked swipe must not turn into a pinch"
     );
 }
@@ -458,7 +481,12 @@ fn counter_clockwise_rotation_is_recognised() {
         .find(|g| matches!(g, Gesture::Rotate { .. }))
         .expect("rotation should be recognised");
     match rot {
-        Gesture::Rotate { direction, delta, fingers, .. } => {
+        Gesture::Rotate {
+            direction,
+            delta,
+            fingers,
+            ..
+        } => {
             assert_eq!(direction, RotateDirection::CounterClockwise);
             assert_eq!(fingers, 4);
             assert!(delta > 0.0, "rotation magnitude is non-negative");
@@ -508,7 +536,14 @@ fn collinear_fingers_drifting_down_swipe_rather_than_rotate() {
         .copied()
         .unwrap_or_else(|| panic!("expected a swipe, began with {begins:?}"));
     assert!(
-        matches!(swipe, Gesture::Swipe { direction: SwipeDirection::Down, fingers: 3, .. }),
+        matches!(
+            swipe,
+            Gesture::Swipe {
+                direction: SwipeDirection::Down,
+                fingers: 3,
+                ..
+            }
+        ),
         "expected a 3-finger downward swipe, got {swipe:?}"
     );
 }
@@ -524,9 +559,13 @@ fn collinear_fingers_drifting_left_also_swipe() {
     h.drag_all(-80.0, 0.0);
     let begins = begin_of(&h.log);
     assert!(
-        begins
-            .iter()
-            .any(|g| matches!(g, Gesture::Swipe { direction: SwipeDirection::Left, .. })),
+        begins.iter().any(|g| matches!(
+            g,
+            Gesture::Swipe {
+                direction: SwipeDirection::Left,
+                ..
+            }
+        )),
         "expected a leftward swipe, began with {begins:?}"
     );
 }
@@ -554,7 +593,10 @@ fn rigid_rotation_leaves_the_centroid_alone() {
 #[test]
 fn single_finger_from_the_bottom_edge_locks_an_edge_swipe() {
     let mut h = Harness::new();
-    let zone = Zone::Edge { edge: Edge::Bottom, third: Third::Center };
+    let zone = Zone::Edge {
+        edge: Edge::Bottom,
+        third: Third::Center,
+    };
     h.down(0, 500.0, 1275.0, Some(zone));
     h.frame();
 
@@ -575,7 +617,9 @@ fn single_finger_from_the_bottom_edge_locks_an_edge_swipe() {
 #[test]
 fn corner_zone_locks_a_corner_swipe() {
     let mut h = Harness::new();
-    let zone = Zone::Corner { corner: Corner::BottomLeft };
+    let zone = Zone::Corner {
+        corner: Corner::BottomLeft,
+    };
     h.down(0, 5.0, 1275.0, Some(zone));
     h.frame();
 
@@ -593,7 +637,10 @@ fn corner_zone_locks_a_corner_swipe() {
 #[test]
 fn edge_zones_are_ignored_once_a_second_finger_lands() {
     let mut h = Harness::new();
-    let zone = Zone::Edge { edge: Edge::Bottom, third: Third::Center };
+    let zone = Zone::Edge {
+        edge: Edge::Bottom,
+        third: Third::Center,
+    };
     h.down(0, 500.0, 1275.0, Some(zone));
     h.frame();
     h.down(1, 600.0, 1200.0, None);
@@ -807,13 +854,16 @@ fn ring(h: &mut Harness) {
 
 fn rotate_ring(h: &mut Harness, angle: f64) {
     let (sin, cos) = angle.sin_cos();
-    let live: Vec<(u32, f64, f64)> = h
-        .r
-        .contacts()
-        .map(|(s, c)| (s.id(), c.pos.x, c.pos.y))
-        .collect();
+    let live: Vec<(u32, f64, f64)> =
+        h.r.contacts()
+            .map(|(s, c)| (s.id(), c.pos.x, c.pos.y))
+            .collect();
     for (slot, x, y) in live {
-        h.move_to(slot, 500.0 + (x - 500.0) * cos - (y - 500.0) * sin, 500.0 + (x - 500.0) * sin + (y - 500.0) * cos);
+        h.move_to(
+            slot,
+            500.0 + (x - 500.0) * cos - (y - 500.0) * sin,
+            500.0 + (x - 500.0) * sin + (y - 500.0) * cos,
+        );
     }
     h.advance(16);
 }

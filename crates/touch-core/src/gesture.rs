@@ -484,7 +484,9 @@ impl Recognizer {
         }
 
         if self.tap_viable {
-            let elapsed = self.started.map_or(Duration::ZERO, |s| time.saturating_sub(s));
+            let elapsed = self
+                .started
+                .map_or(Duration::ZERO, |s| time.saturating_sub(s));
             if elapsed > self.config.tap_max_duration {
                 self.tap_viable = false;
             }
@@ -550,7 +552,13 @@ impl Recognizer {
         let linear = |d: f64| (d.abs() / cfg.progress_distance).clamp(0.0, 1.0);
 
         Some(match active {
-            Active::Swipe { fingers, direction, axis, origin, .. } => {
+            Active::Swipe {
+                fingers,
+                direction,
+                axis,
+                origin,
+                ..
+            } => {
                 let v = centroid - *origin;
                 let d = axis.project(v).abs();
                 Gesture::Swipe {
@@ -560,7 +568,11 @@ impl Recognizer {
                     progress: linear(d),
                 }
             }
-            Active::Pinch { fingers, direction, origin_spread } => {
+            Active::Pinch {
+                fingers,
+                direction,
+                origin_spread,
+            } => {
                 let d = spread - *origin_spread;
                 Gesture::Pinch {
                     fingers: *fingers,
@@ -575,7 +587,13 @@ impl Recognizer {
                 delta: self.rotation_accum(),
                 progress: (self.rotation_accum() / cfg.progress_radians).clamp(0.0, 1.0),
             },
-            Active::EdgeSwipe { edge, third, axis, origin, .. } => {
+            Active::EdgeSwipe {
+                edge,
+                third,
+                axis,
+                origin,
+                ..
+            } => {
                 let v = centroid - *origin;
                 let d = axis.project(v).abs();
                 Gesture::EdgeSwipe {
@@ -585,7 +603,12 @@ impl Recognizer {
                     progress: linear(d),
                 }
             }
-            Active::CornerSwipe { corner, axis, origin, .. } => {
+            Active::CornerSwipe {
+                corner,
+                axis,
+                origin,
+                ..
+            } => {
                 let v = centroid - *origin;
                 let d = axis.project(v).abs();
                 Gesture::CornerSwipe {

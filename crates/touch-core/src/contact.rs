@@ -181,11 +181,18 @@ impl Zone {
     pub const fn edge(self) -> Edge {
         match self {
             Zone::Edge { edge, .. } => edge,
-            Zone::Corner { corner: Corner::TopLeft } | Zone::Corner { corner: Corner::BottomLeft } => {
-                Edge::Left
+            Zone::Corner {
+                corner: Corner::TopLeft,
             }
-            Zone::Corner { corner: Corner::TopRight }
-            | Zone::Corner { corner: Corner::BottomRight } => Edge::Right,
+            | Zone::Corner {
+                corner: Corner::BottomLeft,
+            } => Edge::Left,
+            Zone::Corner {
+                corner: Corner::TopRight,
+            }
+            | Zone::Corner {
+                corner: Corner::BottomRight,
+            } => Edge::Right,
         }
     }
 }
@@ -233,16 +240,24 @@ pub fn classify_zone(pos: Point, size: OutputSize, zone_px: f64) -> Option<Zone>
 
     // Corner squares: within `zone_px` of two edges at once.
     if near_left && near_top {
-        return Some(Zone::Corner { corner: Corner::TopLeft });
+        return Some(Zone::Corner {
+            corner: Corner::TopLeft,
+        });
     }
     if near_right && near_top {
-        return Some(Zone::Corner { corner: Corner::TopRight });
+        return Some(Zone::Corner {
+            corner: Corner::TopRight,
+        });
     }
     if near_left && near_bottom {
-        return Some(Zone::Corner { corner: Corner::BottomLeft });
+        return Some(Zone::Corner {
+            corner: Corner::BottomLeft,
+        });
     }
     if near_right && near_bottom {
-        return Some(Zone::Corner { corner: Corner::BottomRight });
+        return Some(Zone::Corner {
+            corner: Corner::BottomRight,
+        });
     }
 
     // Otherwise the single closest edge within threshold.
@@ -664,20 +679,32 @@ mod tests {
         // Top edge, thirds run left to right.
         assert_eq!(
             classify_zone(pt(100.0, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::Start })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::Start
+            })
         );
         assert_eq!(
             classify_zone(pt(500.0, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::Center })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::Center
+            })
         );
         // Left edge, thirds run top to bottom.
         assert_eq!(
             classify_zone(pt(5.0, 640.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Left, third: Third::Center })
+            Some(Zone::Edge {
+                edge: Edge::Left,
+                third: Third::Center
+            })
         );
         assert_eq!(
             classify_zone(pt(20.0, 1200.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Left, third: Third::End })
+            Some(Zone::Edge {
+                edge: Edge::Left,
+                third: Third::End
+            })
         );
     }
 
@@ -687,7 +714,10 @@ mod tests {
         assert_eq!(classify_zone(pt(48.0, 640.0), SIZE, 48.0), None);
         assert_eq!(
             classify_zone(pt(47.999, 100.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Left, third: Third::Start })
+            Some(Zone::Edge {
+                edge: Edge::Left,
+                third: Third::Start
+            })
         );
     }
 
@@ -697,22 +727,34 @@ mod tests {
         // Just below the first boundary → Start.
         assert_eq!(
             classify_zone(pt(third - 0.001, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::Start })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::Start
+            })
         );
         // Exactly at the boundary → Center.
         assert_eq!(
             classify_zone(pt(third, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::Center })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::Center
+            })
         );
         // Just below the second boundary → Center.
         assert_eq!(
             classify_zone(pt(third * 2.0 - 0.001, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::Center })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::Center
+            })
         );
         // Exactly at the second boundary → End.
         assert_eq!(
             classify_zone(pt(third * 2.0, 20.0), SIZE, 48.0),
-            Some(Zone::Edge { edge: Edge::Top, third: Third::End })
+            Some(Zone::Edge {
+                edge: Edge::Top,
+                third: Third::End
+            })
         );
     }
 
@@ -730,8 +772,14 @@ mod tests {
 
     #[test]
     fn zone_reports_its_edge() {
-        assert_eq!(classify_zone(pt(5.0, 640.0), SIZE, 48.0).unwrap().edge(), Edge::Left);
-        assert_eq!(classify_zone(pt(5.0, 5.0), SIZE, 48.0).unwrap().edge(), Edge::Left);
+        assert_eq!(
+            classify_zone(pt(5.0, 640.0), SIZE, 48.0).unwrap().edge(),
+            Edge::Left
+        );
+        assert_eq!(
+            classify_zone(pt(5.0, 5.0), SIZE, 48.0).unwrap().edge(),
+            Edge::Left
+        );
     }
 
     // ── lifecycle ───────────────────────────────────────────────────────

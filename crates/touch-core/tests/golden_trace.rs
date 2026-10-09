@@ -39,7 +39,9 @@ fn replay(events: &[(Duration, Option<Event>)]) -> (ContactSet, Vec<Frame>) {
 
     for (time, event) in events {
         match event {
-            Some(Event::Down { slot, x, y }) => cs.down(Slot::new(*slot), Point::new(*x, *y), *time),
+            Some(Event::Down { slot, x, y }) => {
+                cs.down(Slot::new(*slot), Point::new(*x, *y), *time)
+            }
             Some(Event::Move { slot, x, y }) => {
                 let ok = cs.motion(Slot::new(*slot), Point::new(*x, *y));
                 assert!(ok, "motion for untracked slot {slot} — tracker desync");
@@ -61,7 +63,14 @@ fn three_finger_drag() -> Vec<(Duration, Option<Event>)> {
 
     // Three fingers land together, 40 px apart vertically.
     for (i, slot) in [0u32, 1, 2].into_iter().enumerate() {
-        ev.push((at(t0), Some(Event::Down { slot, x: 600.0, y: 500.0 + 40.0 * i as f64 })));
+        ev.push((
+            at(t0),
+            Some(Event::Down {
+                slot,
+                x: 600.0,
+                y: 500.0 + 40.0 * i as f64,
+            }),
+        ));
     }
     ev.push((at(t0), None));
 
@@ -70,7 +79,11 @@ fn three_finger_drag() -> Vec<(Duration, Option<Event>)> {
         for (i, slot) in [0u32, 1, 2].into_iter().enumerate() {
             ev.push((
                 at(step * 16),
-                Some(Event::Move { slot, x: 600.0 - 10.0 * step as f64, y: 500.0 + 40.0 * i as f64 }),
+                Some(Event::Move {
+                    slot,
+                    x: 600.0 - 10.0 * step as f64,
+                    y: 500.0 + 40.0 * i as f64,
+                }),
             ));
         }
         ev.push((at(step * 16), None));
@@ -127,14 +140,42 @@ fn pinch_trace_separates_translation_from_radial_motion() {
     // Two fingers converge about a fixed midpoint. The centroid stays put
     // while the spread shrinks — the signature L2 will key pinch on.
     let mut ev = vec![
-        (T0, Some(Event::Down { slot: 0, x: 400.0, y: 500.0 })),
-        (T0, Some(Event::Down { slot: 1, x: 600.0, y: 500.0 })),
+        (
+            T0,
+            Some(Event::Down {
+                slot: 0,
+                x: 400.0,
+                y: 500.0,
+            }),
+        ),
+        (
+            T0,
+            Some(Event::Down {
+                slot: 1,
+                x: 600.0,
+                y: 500.0,
+            }),
+        ),
         (T0, None),
     ];
     for step in 1..=3u64 {
         let d = 100.0 - 10.0 * step as f64;
-        ev.push((at(step * 16), Some(Event::Move { slot: 0, x: 500.0 - d, y: 500.0 })));
-        ev.push((at(step * 16), Some(Event::Move { slot: 1, x: 500.0 + d, y: 500.0 })));
+        ev.push((
+            at(step * 16),
+            Some(Event::Move {
+                slot: 0,
+                x: 500.0 - d,
+                y: 500.0,
+            }),
+        ));
+        ev.push((
+            at(step * 16),
+            Some(Event::Move {
+                slot: 1,
+                x: 500.0 + d,
+                y: 500.0,
+            }),
+        ));
         ev.push((at(step * 16), None));
     }
 
@@ -163,7 +204,14 @@ fn rotation_trace_leaves_centroid_and_spread_alone() {
     let mut ev = Vec::new();
     for (i, slot) in [0u32, 1, 2, 3].into_iter().enumerate() {
         let a = std::f64::consts::FRAC_PI_2 * i as f64;
-        ev.push((T0, Some(Event::Down { slot, x: 500.0 + radius * a.cos(), y: 500.0 + radius * a.sin() })));
+        ev.push((
+            T0,
+            Some(Event::Down {
+                slot,
+                x: 500.0 + radius * a.cos(),
+                y: 500.0 + radius * a.sin(),
+            }),
+        ));
     }
     ev.push((T0, None));
 
@@ -174,13 +222,24 @@ fn rotation_trace_leaves_centroid_and_spread_alone() {
         let (px, py) = (radius * a.cos(), radius * a.sin());
         let rx = px * quarter.cos() + py * quarter.sin();
         let ry = -px * quarter.sin() + py * quarter.cos();
-        ev.push((at(16), Some(Event::Move { slot, x: 500.0 + rx, y: 500.0 + ry })));
+        ev.push((
+            at(16),
+            Some(Event::Move {
+                slot,
+                x: 500.0 + rx,
+                y: 500.0 + ry,
+            }),
+        ));
     }
     ev.push((at(16), None));
 
     let (_, frames) = replay(&ev);
     assert_eq!(frames.len(), 2);
-    assert!((frames[1].rotation_delta - quarter).abs() < 1e-6, "got {}", frames[1].rotation_delta);
+    assert!(
+        (frames[1].rotation_delta - quarter).abs() < 1e-6,
+        "got {}",
+        frames[1].rotation_delta
+    );
     // Rigid rotation: centroid fixed, spread invariant.
     let c = frames[1].centroid.unwrap();
     assert!((c.x - 500.0).abs() < 1e-6 && (c.y - 500.0).abs() < 1e-6);
@@ -195,7 +254,11 @@ fn hotplug_mid_gesture_leaves_a_clean_empty_set() {
     // exists because this was once silently mishandled.
     let mut cs = ContactSet::new();
     for (i, slot) in [0u32, 1, 2].into_iter().enumerate() {
-        cs.down(Slot::new(slot), Point::new(600.0, 500.0 + 40.0 * i as f64), T0);
+        cs.down(
+            Slot::new(slot),
+            Point::new(600.0, 500.0 + 40.0 * i as f64),
+            T0,
+        );
     }
     cs.frame(T0);
     assert_eq!(cs.len(), 3);
@@ -226,10 +289,16 @@ fn zone_classification_survives_output_rotation() {
     // Bottom edge, centre third, on both.
     assert_eq!(
         classify_zone(Point::new(500.0, 1279.0), portrait, zone_px),
-        Some(Zone::Edge { edge: touch_core::Edge::Bottom, third: touch_core::Third::Center })
+        Some(Zone::Edge {
+            edge: touch_core::Edge::Bottom,
+            third: touch_core::Third::Center
+        })
     );
     assert_eq!(
         classify_zone(Point::new(640.0, 999.0), landscape, zone_px),
-        Some(Zone::Edge { edge: touch_core::Edge::Bottom, third: touch_core::Third::Center })
+        Some(Zone::Edge {
+            edge: touch_core::Edge::Bottom,
+            third: touch_core::Third::Center
+        })
     );
 }

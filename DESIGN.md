@@ -219,11 +219,29 @@ PR 3 (L1) has no dependency on that answer, which is why it goes first.
 |---|---|
 | 3 — L1 contact tracking | **done** |
 | 4 — L2 recogniser | **done** |
-| 5 — L3 arbitration | not started |
+| 5 — L3 arbitration | **done** (`crates/touch-arbitrate`) |
 | 1, 2 — config grammar | blocked on the [niri-wm/niri#3771][pr3771] check above |
 
-`crates/touch-core` now carries both lower layers: **70 tests, clippy clean,
-zero dependencies**.
+`crates/touch-core` carries both lower layers: **70 tests, clippy clean,
+zero dependencies**. `crates/touch-arbitrate` adds L3: **98 tests total**,
+one dependency (touch-core), still no clock and no smithay.
+
+L3 answers the question the other two layers leave open: *who owns this
+touch?* One `Ownership` enum (`Compositor` / `Client` / `Ignored`), one
+transition function `decide(ctx, policy, compositor_owned_in_sequence)`, and
+one ledger `Arbitrator` that records ownership per slot. The precedence
+chain is documented as a contract in `decide`'s doc comment and mirrors
+niri-touch's edge > Mod > passthrough ordering; the pen and eraser rules
+and the rect exclusion layer on top of it.
+
+The invariant patch `0011` is about is enforced as an API contract rather
+than a comment: `Arbitrator::clear()` *returns* the number of
+client-visible touches the caller must close, and `open_client_touches()`
+makes that number checkable without a seat. A test asserts
+`clear() == open_client_touches()` before teardown. Pen and eraser slots
+are tracked in a separate set so a resting stylus can never arm the
+compositor's gesture recogniser for the next finger — the bug that would
+present as random gesture activation.
 
 L1 currently provides: slot lifecycle (`down`/`motion`/`up`/`clear`), per-frame
 derived geometry (`centroid`, `centroid_delta`, `spread`, `rotation_delta`,
@@ -259,12 +277,17 @@ swipe. A rigid rotation holds the centroid still; a translation does not.
 niri-toublet/
 ├── DESIGN.md              # this file
 └── crates/
-    └── touch-core/        # L1 + L2, zero dependencies
+    ├── touch-core/        # L1 + L2, zero dependencies
+    │   ├── src/
+    │   │   ├── lib.rs
+    │   │   ├── contact.rs # L1: slot lifecycle + derived geometry + zones
+    │   │   └── gesture.rs  # L2: recogniser
+    │   └── tests/
+    │       ├── golden_trace.rs # L1, driven headlessly
+    │       └── recognizer.rs   # L2 behaviour + lifecycle invariant
+    └── touch-arbitrate/   # L3, one dependency: touch-core
         ├── src/
-        │   ├── lib.rs
-        │   ├── contact.rs # L1: slot lifecycle + derived geometry + zones
-        │   └── gesture.rs  # L2: recogniser
+        │   └── lib.rs     # Ownership, decide(), Arbitrator
         └── tests/
-            ├── golden_trace.rs # L1, driven headlessly
-            └── recognizer.rs   # L2 behaviour + lifecycle invariant
+            └── arbitration_trace.rs # L3, golden-style ownership traces
 ```

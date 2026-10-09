@@ -1,0 +1,18 @@
+[package]
+name = "touch-arbitrate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Pure touch ownership arbitration for niri-toublet"
+license = "GPL-3.0-only"
+publish = false
+
+# One dependency, and it is the layer below. No smithay, no niri-config, no
+# clock. Everything that needs a live seat is the caller's problem; the
+# decision itself is a pure function of (down-context, policy, ledger).
+[dependencies]
+touch-core = { path = "../touch-core" }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
