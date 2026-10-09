@@ -1,0 +1,19 @@
+[package]
+name = "touch-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Pure, headless touchscreen contact tracking and gesture recognition for niri-toublet"
+license = "GPL-3.0-only"
+publish = false
+
+# Intentionally zero dependencies.
+#
+# L1/L2 must be testable without a compositor, without a Wayland connection,
+# and without libspa. Anything that needs smithay or niri-config belongs in
+# L3 (arbitration), which is a thin adapter over this crate.
+[dependencies]
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
