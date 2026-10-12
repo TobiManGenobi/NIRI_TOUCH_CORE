@@ -10,17 +10,27 @@ this README is the orientation map.
 
 ---
 
-## Layout — two repos
+## Layout — one repo, two projects
+
+`NIRI_TOUCH_CORE/` is a **single git repository**. Its working tree is this
+whole directory, and it tracks both projects as ordinary subdirectories:
 
 ```
-NIRI_TOUCH_CORE/
-├── niri/           the niri fork carrying the rewrite
-│                   branch: touch-core-l1l2l3   tip: e774e9ae
-│                   remote: origin → https://github.com/niri-wm/niri.git
-└── niri-toublet/   the pure L1/L2/L3 crates
-                    branch: master   tip: 9890ab7   (7 commits)
-                    remote: NONE  ← see the warning at the bottom
+NIRI_TOUCH_CORE/          ← the one repository (branch: main)
+├── niri/                 the niri fork carrying the rewrite
+│                         history: branch touch-core-l1l2l3 grafted in,
+│                         tip e774e9ae, on top of the upstream niri history
+│                         from 2c82b77a
+└── niri-toublet/         the pure L1/L2/L3 crates
+                          history: branch master grafted in, tip 9890ab7
+                          (7 commits)
 ```
+
+The two histories were combined with `git subtree add --prefix=…`, so both
+are real commits in this one repository and remain reachable by their
+original hashes (`e774e9ae`, `9890ab7`). There are **no nested `.git`
+directories** and no submodules. The upstream niri ancestry is intact, so
+the niri side can still be rebased onto future upstream releases.
 
 **`niri/`** is a fork of niri at upstream commit `2c82b77a` with the
 touchscreen rewrite applied on top as a single commit, `e774e9ae`
@@ -42,10 +52,12 @@ touch-core      = { path = "../niri-toublet/crates/touch-core" }
 **`niri-toublet/`** is a small Cargo workspace holding the pure crates:
 `crates/touch-core` (L1 + L2) and `crates/touch-arbitrate` (L3).
 
-> ⚠️ **The `../` in those paths is load-bearing.** `niri-toublet/` must be a
-> **sibling** of `niri/`, directly inside this project root. If you move one
-> without the other, the relative path breaks and the build fails. Do not fix
-> this by editing `Cargo.toml` — fix the directory layout.
+> ⚠️ **The `../` in those paths is load-bearing.** `niri-toublet/` must remain
+> a **sibling** of `niri/`, both directly inside this project root. If you
+> move one without the other, the relative path breaks and the build fails.
+> Do not fix this by editing `Cargo.toml` — fix the directory layout. Being
+> in one repository does not relax this: the two are tracked as plain
+> subdirectories, not submodules, so a checkout still needs them adjacent.
 
 ---
 
@@ -115,7 +127,8 @@ bugs in that fused state machine.
 
 ## Build and test
 
-Both repos are ordinary Cargo projects. Build **from `niri/`**:
+Both projects are ordinary Cargo projects, inside this one repository.
+Build **from `niri/`**:
 
 ```sh
 cd niri
@@ -130,12 +143,17 @@ cd niri-toublet
 cargo test                 # 120 passed, 0 failed
 ```
 
-If you are short on disk, point cargo at a target dir on the real volume
-rather than `/tmp`, which is a small tmpfs here:
+**Always set `CARGO_TARGET_DIR` to somewhere on the real disk.** `/tmp` is a
+small tmpfs (3.8G) and a niri build needs roughly 10G, so a default target
+dir under `/tmp` dies with `Disk quota exceeded`:
 
 ```sh
-CARGO_TARGET_DIR=/path/on/real/disk/.target-check cargo test --workspace
+CARGO_TARGET_DIR=/run/media/tobiasmagnegraneberg/Developer/Developer/.target-check \
+  cargo test --workspace
 ```
+
+The root `.gitignore` excludes `/target/`, so build artifacts are never
+tracked.
 
 ---
 
@@ -149,7 +167,7 @@ CARGO_TARGET_DIR=/path/on/real/disk/.target-check cargo test --workspace
 
 | | `NIRI_TOUCH_CORE/` (this) | `../NIRI/` (niri-tablet) |
 |---|---|---|
-| Shape | a fork + separate pure crates | a patch series vs upstream |
+| Shape | one repo: a fork + pure crates as subdirs | a patch series vs upstream |
 | Touch layers | L1/L2/L3, three-way split | fused into `src/input/mod.rs` |
 | Config | one `bind` grammar with `fingers=` properties | fixed `gestures {}` nodes |
 
@@ -167,18 +185,28 @@ Because of that last point, **`../NIRI/niri/` is retained**, still on branch
 `touch-core-l1l2l3` at `e774e9ae`, as the pristine input for the patch
 series. `../NIRI/niri-toublet/` is likewise retained: the `touch-core-l1l2l3`
 checkout in `../NIRI/niri` still resolves its `../niri-toublet/crates/*`
-path dependencies from there. Removing either would break that checkout, so
-this project holds verified *copies* rather than having moved the originals.
+path dependencies from there — the same load-bearing sibling requirement
+described above. Removing either would break that checkout, so it keeps its
+own copies. This project is unaffected: it builds against the directories
+inside `NIRI_TOUCH_CORE/`, not the ones under `../NIRI/`.
 
 ---
 
-## ⚠️ CRITICAL WARNING — `niri-toublet` has no remote
+## ⚠️ WARNING — this repository has no remote
 
-`niri-toublet/` is a git repository with **7 commits and no configured
-remote**. It has never been pushed anywhere. `niri/` is safe by comparison:
-its only remote is public upstream `github.com/niri-wm/niri.git`, and the
-rewrite commit `e774e9ae` exists on a local branch there, not upstream.
+This repository has **no configured remote and has never been pushed
+anywhere**. The `niri-toublet` history that used to live in its own
+un-backed-up repository now lives here, in this root repository, as real
+reachable commits (tip `9890ab7`). The rewrite commit `e774e9ae` likewise
+lives here, with the upstream niri ancestry behind it.
 
-**If this disk fails, the pure crates are gone.** There is no second copy.
-Give `niri-toublet/` a remote and push it, or take a backup, before relying on
-this project.
+That resolves the old "the pure crates exist in exactly one place" hazard in
+the sense that both histories are now in a single git repository — but the
+repository itself is still only on **this disk**. Unifying the repos did not
+create a backup.
+
+**So the risk is still present, just relocated.** Before relying on this
+project, either give this repository a remote and push it, or take a backup
+of `NIRI_TOUCH_CORE/.git`. Upstream `github.com/niri-wm/niri.git` holds the
+niri history but neither the rewrite commit nor the `niri-toublet` commits,
+so cloning upstream does not recover this work.
