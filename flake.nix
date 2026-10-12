@@ -42,6 +42,10 @@
           src = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
+              # The L1/L2/L3 touch crates are workspace members that the
+              # niri package consumes by path; without them `cargo build`
+              # inside the nix sandbox cannot resolve `crates/*`.
+              ./crates
               ./niri-config
               ./niri-ipc
               ./niri-visual-tests

@@ -1,9 +1,15 @@
 [workspace]
 members = [
+    "crates/touch-core",
+    "crates/touch-arbitrate",
     "niri-config",
     "niri-ipc",
     "niri-visual-tests",
+    ".",
 ]
+
+resolver = "2"
+
 
 [workspace.package]
 version = "26.4.0"
@@ -47,7 +53,7 @@ edition.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-readme = "README.md"
+readme = "README.niri.md"
 keywords = ["wayland", "compositor", "tiling", "smithay", "wm"]
 
 [dependencies]
@@ -88,13 +94,12 @@ sd-notify = "0.5.0"
 serde.workspace = true
 serde_json.workspace = true
 smithay-drm-extras.workspace = true
-# L1/L2/L3 of the touch stack (touch-core, touch-arbitrate) live OUTSIDE this
-# repository. They are vendored as a sibling checkout of this project root;
-# the canonical location is <project root>/niri-toublet/crates/.
-# These paths escape the niri/ directory but stay within the project root, so
-# the tree remains self-contained and portable.
-touch-arbitrate = { path = "../niri-toublet/crates/touch-arbitrate" }
-touch-core = { path = "../niri-toublet/crates/touch-core" }
+# L1/L2/L3 of the touch stack (touch-core, touch-arbitrate) are members of this
+# same workspace, so these path dependencies are plain in-tree references.
+# They used to live in a separate `niri-toublet/` workspace consumed through
+# `../`, which forced the two directories to stay siblings of one another.
+touch-arbitrate = { path = "crates/touch-arbitrate" }
+touch-core = { path = "crates/touch-core" }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 tracy-client.workspace = true

@@ -1,4 +1,7 @@
-# niri-toublet — design
+# DESIGN — the L1/L2/L3 touchscreen rewrite
+
+The crates described here are members of the single `NIRI_TOUCH_CORE/`
+workspace, under `crates/`.
 
 A niri fork with a first-class touchscreen layer: simpler than either
 existing fork, more stable, and configurable enough to be a real
@@ -293,20 +296,18 @@ swipe. A rigid rotation holds the centroid still; a translation does not.
 ## Layout
 
 ```
-niri-toublet/
-├── DESIGN.md              # this file
-└── crates/
-    ├── touch-core/        # L1 + L2, zero dependencies
-    │   ├── src/
-    │   │   ├── lib.rs
-    │   │   ├── contact.rs # L1: slot lifecycle + derived geometry + zones
-    │   │   └── gesture.rs  # L2: recogniser
-    │   └── tests/
-    │       ├── golden_trace.rs # L1, driven headlessly
-    │       └── recognizer.rs   # L2 behaviour + lifecycle invariant
-    └── touch-arbitrate/   # L3, one dependency: touch-core
-        ├── src/
-        │   └── lib.rs     # Ownership, decide(), Arbitrator
-        └── tests/
-            └── arbitration_trace.rs # L3, golden-style ownership traces
+crates/
+├── touch-core/        # L1 + L2, zero dependencies
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── contact.rs # L1: slot lifecycle + derived geometry + zones
+│   │   └── gesture.rs  # L2: recogniser
+│   └── tests/
+│       ├── golden_trace.rs # L1, driven headlessly
+│       └── recognizer.rs   # L2 behaviour + lifecycle invariant
+└── touch-arbitrate/   # L3, one dependency: touch-core
+    ├── src/
+    │   └── lib.rs     # Ownership, decide(), Arbitrator
+    └── tests/
+        └── arbitration_trace.rs # L3, golden-style ownership traces
 ```

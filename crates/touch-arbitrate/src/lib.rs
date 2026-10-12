@@ -1,4 +1,4 @@
-//! `touch-arbitrate` — layer L3 of the niri-toublet touch stack.
+//! `touch-arbitrate` — layer L3 of the niri touch stack.
 //!
 //! See `DESIGN.md` at the repository root for the full architecture. L1
 //! (`touch_core::contact`) and L2 (`touch_core::gesture`) are pure state

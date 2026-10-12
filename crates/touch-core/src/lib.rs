@@ -1,4 +1,4 @@
-//! `touch-core` — layers L1 and L2 of the niri-toublet touch stack.
+//! `touch-core` — layers L1 and L2 of the niri touch stack.
 //!
 //! See `DESIGN.md` at the repository root for the full architecture. In
 //! short, the touch stack is three layers with one-way dependencies:

@@ -3,7 +3,7 @@ name = "touch-core"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Pure, headless touchscreen contact tracking and gesture recognition for niri-toublet"
+description = "Pure, headless touchscreen contact tracking and gesture recognition for the niri touch stack"
 license = "GPL-3.0-only"
 publish = false
 

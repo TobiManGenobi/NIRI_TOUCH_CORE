@@ -1,5 +1,16 @@
 # Cargo build artifacts (can be ~12G for niri)
 /target/
 
+# Scratch output produced by the niri test harness.
+/result
+
+.idea
+
+# `Cargo.lock` is intentionally NOT ignored. The workspace has no binaries
+# today, but it is version-controlled like one: a compositor fork pins its
+# dependency graph so that a test failure on one machine is reproducible on
+# another. touch-core is dependency-free, so the lock stays trivial and
+# nothing is gained by regenerating it ad hoc.
+
 # Never track nested repositories - the unified repo is the only git history here.
 .git/
