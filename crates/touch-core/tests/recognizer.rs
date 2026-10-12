@@ -61,6 +61,23 @@ impl Harness {
         &self.log
     }
 
+    /// Seal a frame, appending to the log instead of replacing it.
+    ///
+    /// `frame` is per-frame state and clears, which is what most tests want
+    /// and what keeps them short. A test that drives a whole gesture and
+    /// then asks what it produced needs the opposite: the recogniser emits
+    /// events over many frames, and clearing between them loses everything
+    /// but the last one.
+    fn frame_accum(&mut self) {
+        let evs = self.r.frame(self.t());
+        self.log.extend(evs);
+    }
+
+    /// Every event seen since the harness was built.
+    fn all(&self) -> Vec<GestureEvent> {
+        self.log.clone()
+    }
+
     fn frame_at(&mut self, ms: u64) -> &[GestureEvent] {
         self.ms = ms;
         self.frame()
@@ -97,6 +114,20 @@ fn begin_of(evs: impl AsRef<[GestureEvent]>) -> Vec<Gesture> {
         .iter()
         .filter_map(|e| match e {
             GestureEvent::Begin(g) => Some(*g),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `End` event as `(gesture, completed)`.
+///
+/// `completed` is the only field L3 acts on — it fires an action on a
+/// completed `End` and nothing otherwise — so it is what these tests assert.
+fn ends_of(evs: impl AsRef<[GestureEvent]>) -> Vec<(Gesture, bool)> {
+    evs.as_ref()
+        .iter()
+        .filter_map(|e| match e {
+            GestureEvent::End { gesture, completed } => Some((*gesture, *completed)),
             _ => None,
         })
         .collect()
@@ -655,6 +686,70 @@ fn edge_zones_are_ignored_once_a_second_finger_lands() {
             );
         }
     }
+}
+
+/// An edge swipe must reach `progress: 1.0` (`completed: true`) over a
+/// realistic inward drag, because L3 fires an action only on a *completed*
+/// `End`. If it cannot, the bind silently never fires and edge swipes look
+/// dead on hardware even though the zone was classified and the gesture was
+/// recognised — which is exactly the failure this pins.
+///
+/// The geometry here is the real one from the bug report: a 1066x711 logical
+/// panel, a finger landing 21 logical px from the left edge, dragged inward
+/// the ~215 px a deliberate swipe covers.
+#[test]
+fn a_realistic_edge_swipe_reaches_the_completion_threshold() {
+    /// The real geometry from the bug report: a 1066x711 logical panel, a
+    /// finger landing on the bottom edge, dragged inward.
+    fn drag(inward_px: f64) -> Vec<GestureEvent> {
+        let mut h = Harness::new();
+        h.down(
+            0,
+            533.0,
+            711.0,
+            Some(Zone::Edge {
+                edge: Edge::Bottom,
+                third: Third::Center,
+            }),
+        );
+        h.frame_accum();
+        // In small steps, the way a real finger arrives: a single large
+        // jump is not what the digitiser sends.
+        let steps = 40;
+        for _ in 0..steps {
+            h.drag_all(0.0, -inward_px / steps as f64);
+            h.frame_accum();
+        }
+        h.up(0);
+        h.frame_accum();
+        h.all()
+    }
+
+    let completion_px = RecognizerConfig::default().progress_distance;
+
+    // Short of the completion distance: recognised, but not completed.
+    // Scoped to the edge swipe — the same motion also emits a completed
+    // `TapHold`, which is a different gesture on a different bind.
+    let short: Vec<_> = ends_of(drag(completion_px * 0.5))
+        .into_iter()
+        .filter(|(g, _)| matches!(g, Gesture::EdgeSwipe { .. }))
+        .collect();
+    assert!(!short.is_empty(), "the edge swipe must still be recognised");
+    assert!(
+        short.iter().all(|(_, completed)| !*completed),
+        "a swipe of half the completion distance must not report completion, got {short:?}"
+    );
+
+    // The same swipe, carried to the full completion distance.
+    let full: Vec<_> = ends_of(drag(completion_px))
+        .into_iter()
+        .filter(|(g, _)| matches!(g, Gesture::EdgeSwipe { .. }))
+        .collect();
+    assert!(!full.is_empty(), "the edge swipe must still be recognised");
+    assert!(
+        full.iter().any(|(_, completed)| *completed),
+        "an edge swipe of the full completion distance must report completion, got {full:?}"
+    );
 }
 
 // ── finger-count bounds ────────────────────────────────────────────────────
