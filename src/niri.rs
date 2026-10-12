@@ -14,6 +14,7 @@ use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as 
 use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
+use niri_config::gestures::ShowTouchPoints;
 use niri_config::output::MaxBpc;
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
@@ -180,6 +181,7 @@ use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::touch_points::TouchPoints;
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -407,6 +409,7 @@ pub struct Niri {
 
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
+    pub touch_points: TouchPoints,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
 
@@ -2557,6 +2560,7 @@ impl Niri {
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+        let touch_points = TouchPoints::new(animation_clock.clone());
 
         let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
         if !config_.hotkey_overlay.skip_at_startup {
@@ -2751,6 +2755,7 @@ impl Niri {
 
             screenshot_ui,
             config_error_notification,
+            touch_points,
             hotkey_overlay,
             exit_confirm_dialog,
 
@@ -4215,6 +4220,7 @@ impl Niri {
 
         self.layout.advance_animations();
         self.config_error_notification.advance_animations();
+        self.touch_points.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
@@ -4388,6 +4394,21 @@ impl Niri {
         // Next, the config error notification too.
         if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {
             push(element.into());
+        }
+
+        // Next, the touch point visualization dots: purely observational,
+        // drawn on top of the scene so any screen recording captures them.
+        let touch_points_mode = self.config.borrow().gestures.show_touch_points;
+        if touch_points_mode != ShowTouchPoints::Off {
+            if let Some(geometry) = self.global_space.output_geometry(output) {
+                self.touch_points.render(
+                    ctx.renderer,
+                    output,
+                    geometry.to_f64(),
+                    touch_points_mode,
+                    &mut |elem| push(elem.into()),
+                );
+            }
         }
 
         // If the session is locked, draw the lock surface.
@@ -4759,6 +4780,7 @@ impl Niri {
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
                 self.config_error_notification.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.touch_points.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();

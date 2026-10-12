@@ -8,6 +8,7 @@ use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
 };
+use niri_config::gestures::ShowTouchPoints;
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
@@ -4343,6 +4344,10 @@ impl State {
         };
         let slot = evt.slot();
 
+        // Touch point visualisation. Purely observational — see
+        // `note_touch_point_down`.
+        self.note_touch_point_down(slot, pos);
+
         let serial = SERIAL_COUNTER.next_serial();
 
         let under = self.niri.contents_under(pos);
@@ -4685,6 +4690,10 @@ impl State {
         // `feed_sequence`.
         touch_arbitration_grab::forget_live_contact(touch_arbitration_grab::slot_id(slot));
 
+        // The overlay remembers each dot's position, so a positionless up
+        // event only starts its fade-out.
+        self.note_touch_point_up(slot);
+
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
                 self.confirm_screenshot(true);
@@ -4718,6 +4727,10 @@ impl State {
             return;
         };
         let slot = evt.slot();
+
+        // Feed the visualisation overlay before any of the grab handling, so
+        // a dot follows the finger even while a client holds the contact.
+        self.note_touch_point_motion(slot, pos);
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
             let geom = self.niri.global_space.output_geometry(&output).unwrap();
@@ -4776,6 +4789,77 @@ impl State {
         // A cancel ends every contact at once and tells us none of their
         // ids, so the ledger is cleared wholesale.
         touch_arbitration_grab::reset_persistent_traced(self);
+
+        // A cancel names no slots, so every dot fades out at once.
+        self.note_touch_points_cancel();
+    }
+
+    /// How many concurrent fingers arm a gesture, for the touch-point
+    /// overlay's `gestures` mode.
+    ///
+    /// The overlay is a view of the same threshold the arbitrator uses, so it
+    /// reads that threshold from `touch-arbitrate` rather than carrying a
+    /// second copy that could drift from the recogniser's.
+    fn touch_point_min_fingers() -> usize {
+        touch_arbitrate::DEFAULT_MIN_GESTURE_FINGERS as usize
+    }
+
+    /// Whether the touch-point overlay is on. Off by default, so the default
+    /// path costs one config borrow and nothing else.
+    fn touch_points_enabled(&self) -> bool {
+        self.niri.config.borrow().gestures.show_touch_points != ShowTouchPoints::Off
+    }
+
+    /// Note a finger going down for the visualisation overlay.
+    ///
+    /// A pure observer: it consumes nothing and alters nothing, so it cannot
+    /// change what any gesture does. Like the live-contact ledger it runs on
+    /// *every* down regardless of ownership — the overlay shows what is on
+    /// the glass, and a client-owned finger is still a finger.
+    fn note_touch_point_down(&mut self, slot: TouchSlot, pos: Point<f64, Logical>) {
+        if !self.touch_points_enabled() {
+            return;
+        }
+        self.niri
+            .touch_points
+            .down(slot, pos, Self::touch_point_min_fingers());
+        // Redraw every output rather than just the one under the finger: the
+        // dots are global logical positions and a multi-monitor finger that
+        // moves or lands near a boundary must not leave a stale dot behind on
+        // the output it left. Only reached when the feature is enabled.
+        self.niri.queue_redraw_all();
+    }
+
+    /// Note a finger moving. Never called with the overlay disabled.
+    fn note_touch_point_motion(&mut self, slot: TouchSlot, pos: Point<f64, Logical>) {
+        if !self.touch_points_enabled() {
+            return;
+        }
+        self.niri
+            .touch_points
+            .motion(slot, pos, Self::touch_point_min_fingers());
+        self.niri.queue_redraw_all();
+    }
+
+    /// Note a finger lifting. The overlay remembers the position, so this
+    /// only starts the fade-out.
+    fn note_touch_point_up(&mut self, slot: TouchSlot) {
+        if !self.touch_points_enabled() || self.niri.touch_points.is_empty() {
+            return;
+        }
+        self.niri.touch_points.up(slot);
+        self.niri.queue_redraw_all();
+    }
+
+    /// The backend cancelled every contact at once (device removed, seat torn
+    /// down) without naming their slots. Fade the dots out rather than
+    /// leaving them stuck on screen forever.
+    fn note_touch_points_cancel(&mut self) {
+        if !self.touch_points_enabled() || self.niri.touch_points.is_empty() {
+            return;
+        }
+        self.niri.touch_points.cancel();
+        self.niri.queue_redraw_all();
     }
 
     fn on_switch_toggle<I: InputBackend>(&mut self, evt: I::SwitchToggleEvent) {

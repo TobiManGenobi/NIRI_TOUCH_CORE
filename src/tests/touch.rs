@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use niri_config::{Action, Config};
 use wayland_client::protocol::wl_surface::WlSurface;
+use smithay::utils::Point;
 
 use crate::input::touch_arbitration_grab;
 use crate::tests::client::{ClientId, TouchEvent};
@@ -828,5 +829,165 @@ fn a_device_removed_mid_sequence_leaves_no_routed_slot_behind() {
         touch_arbitration_grab::live_contacts()
     );
 
+    assert_no_grab(&mut f);
+}
+/// A fixture whose only non-default setting is the touch-point overlay, so a
+/// failure below is about the overlay and not about gesture recognition.
+fn set_up_with_touch_points(mode: &str) -> (Fixture, ClientId) {
+    let config =
+        Config::parse_mem(&format!("gestures {{ show-touch-points {mode} }}")).unwrap().config;
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, OUTPUT);
+    f.add_touch_device();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    window.commit();
+    f.roundtrip(id);
+
+    f
+}
+
+/// The overlay tracks the glass: a down produces a dot, a lift removes it.
+///
+/// This drives the real event path through `on_touch_down`/`on_touch_up`
+/// rather than calling `TouchPoints` directly, because the interesting
+/// failure is the wiring — an overlay that works in isolation but is never
+/// fed is exactly the bug worth catching.
+#[test]
+fn touch_down_adds_a_point_and_touch_up_removes_it() {
+    let (mut f, id) = set_up_with_touch_points("all");
+
+    assert!(
+        f.niri().touch_points.is_empty(),
+        "a fresh compositor must start with no dots"
+    );
+
+    let mut t = Duration::ZERO;
+    f.touch_down(0, CENTER.0, CENTER.1, t);
+    t += STEP;
+    f.touch_frame(t);
+    f.roundtrip(id);
+
+    let positions = f.niri().touch_points.active_positions();
+    assert_eq!(
+        positions,
+        vec![Point::from(CENTER)],
+        "the finger's touchdown must produce exactly one dot at its position"
+    );
+
+    f.touch_up(0, t);
+    t += STEP;
+    f.touch_frame(t);
+    f.roundtrip(id);
+
+    assert!(
+        f.niri().touch_points.active_positions().is_empty(),
+        "a lifted finger must stop being an active contact, got {:?}",
+        f.niri().touch_points.active_positions()
+    );
+
+    assert_no_grab(&mut f);
+}
+
+/// The dot follows a dragging finger rather than freezing at the touchdown.
+#[test]
+fn touch_point_follows_a_moving_finger() {
+    let (mut f, id) = set_up_with_touch_points("all");
+
+    let mut t = Duration::ZERO;
+    f.touch_down(0, CENTER.0, CENTER.1, t);
+    t += STEP;
+    f.touch_frame(t);
+
+    let moved = (CENTER.0 + 200., CENTER.1 - 100.);
+    f.touch_motion(0, moved.0, moved.1, t);
+    t += STEP;
+    f.touch_frame(t);
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.niri().touch_points.active_positions(),
+        vec![Point::from(moved)],
+        "the dot must track the finger, not stay at the touchdown point"
+    );
+
+    f.touch_up(0, t);
+    f.touch_frame(t);
+    assert_no_grab(&mut f);
+}
+
+/// The feature is off by default, so the default path must add no dots at
+/// all. Without this the suite above would still pass if the overlay were
+/// unconditionally wired.
+#[test]
+fn touch_points_are_off_by_default() {
+    let mut f = Fixture::new();
+    f.add_output(1, OUTPUT);
+    f.add_touch_device();
+    let id = f.add_client();
+    let client = f.client(id).create_window();
+    client.commit();
+    f.roundtrip(id);
+
+    f.touch_down(0, CENTER.0, CENTER.1, Duration::ZERO);
+    f.touch_frame(Duration::from_millis(STEP.as_millis() as u64));
+    f.roundtrip(id);
+
+    assert!(
+        f.niri().touch_points.is_empty(),
+        "with the default config nothing may be drawn"
+    );
+
+    f.touch_up(0, Duration::from_millis(STEP.as_millis() as u64));
+    f.touch_frame(Duration::ZERO);
+    assert_no_grab(&mut f);
+}
+
+/// `gestures` mode shows nothing for one finger, then everything once the
+/// gesture threshold is met — and the fingers that landed first are included.
+#[test]
+fn touch_points_gestures_mode_waits_for_the_threshold() {
+    let (mut f, id) = set_up_with_touch_points("gestures");
+
+    let mut t = Duration::ZERO;
+    f.touch_down(0, CENTER.0 - 150., CENTER.1, t);
+    t += STEP;
+    f.touch_frame(t);
+    f.roundtrip(id);
+
+    assert!(
+        f.niri()
+            .touch_points
+            .renderable_dots(niri_config::gestures::ShowTouchPoints::Gestures)
+            .is_empty(),
+        "one finger is not a gesture, so no dot may render"
+    );
+
+    f.touch_down(1, CENTER.0, CENTER.1, t);
+    t += STEP;
+    f.touch_down(2, CENTER.0 + 150., CENTER.1, t);
+    t += STEP;
+    f.touch_frame(t);
+    f.roundtrip(id);
+
+    let visible = f
+        .niri()
+        .touch_points
+        .renderable_dots(niri_config::gestures::ShowTouchPoints::Gestures);
+    assert_eq!(
+        visible.len(),
+        3,
+        "once the threshold is met every finger shows, including the two that \
+         landed first, got {}",
+        visible.len()
+    );
+
+    for i in 0..3 {
+        f.touch_up(i, t);
+        t += STEP;
+    }
+    f.touch_frame(t);
     assert_no_grab(&mut f);
 }

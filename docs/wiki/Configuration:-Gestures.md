@@ -28,6 +28,10 @@ gestures {
         // bottom-left
         // bottom-right
     }
+
+    // Draw a dot under every finger, or only during multi-finger gestures.
+    // show-touch-points all
+    // show-touch-points gestures
 }
 ```
 
@@ -113,3 +117,36 @@ gestures {
 ```
 
 You can also customize hot corners per-output [in the output config](./Configuration:-Outputs.md#hot-corners).
+
+### `show-touch-points`
+
+<sup>Since: 26.04</sup>
+
+Draw a translucent dot under each finger touching the screen.
+The dots fade in when a finger lands and fade out when it lifts, and the compositor draws them on top of everything, so a screen recording captures them.
+This is for demo videos and for debugging gestures, and it is off by default.
+
+This setting is purely observational.
+It never consumes or alters touch events, so turning it on cannot change what any gesture does, and a client still receives its touches exactly as before.
+
+The options are:
+
+- `all`: every touch point gets a dot, including a single finger tapping or scrolling.
+- `gestures`: dots appear only once enough fingers are down concurrently to drive a gesture (three by default), so ordinary taps and scrolling stay clean.
+  A finger that landed before the threshold was reached gets its dot at the same moment the gesture becomes possible, rather than popping in late.
+
+Omitting the setting is equivalent to `off`.
+
+```kdl
+// Show a dot under every finger.
+gestures {
+    show-touch-points all
+}
+```
+
+```kdl
+// Only show dots while a multi-finger gesture is possible.
+gestures {
+    show-touch-points gestures
+}
+```
