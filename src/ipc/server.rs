@@ -1,10 +1,11 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use std::{env, io, process};
 
 use anyhow::Context;
@@ -18,7 +19,8 @@ use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
     Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Timestamp, TouchOwnership, TouchTrace, TouchTraceEntry, WindowLayout, Workspace,
+    TOUCH_TRACE_CAPACITY,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -42,6 +44,81 @@ use crate::window::Mapped;
 // number in our buffer, we drop that event stream client.
 const EVENT_STREAM_BUFFER_SIZE: usize = 64;
 
+/// Bounded ring buffer of the most recent touch-trace events.
+///
+/// The touch events are push-only, so a debugging client that attaches after
+/// the bug has already happened has nothing to look at. This keeps a short
+/// recent history so it can be read back with [`Request::TouchTrace`], the
+/// same shape as Android's `InputDispatcher::mRecentQueue`.
+///
+/// Deliberately not a full replay log: the last few hundred entries are what
+/// explain a gesture that misbehaved, and an unbounded buffer on a path that
+/// runs on every finger-down would be an unbounded memory cost for history
+/// nobody will ever read.
+///
+/// The hot path is a `VecDeque` with reserved capacity: past the first
+/// [`TOUCH_TRACE_CAPACITY`] pushes it reuses the slot freed by the `pop_front`
+/// and allocates nothing.
+struct TouchTraceRing {
+    entries: VecDeque<TouchTraceEntry>,
+    /// Sequence number to hand to the next entry. Never 0, never reused.
+    next_sequence: u64,
+}
+
+impl TouchTraceRing {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(TOUCH_TRACE_CAPACITY),
+            next_sequence: 1,
+        }
+    }
+
+    /// Append one event, dropping the oldest entry if the buffer is full.
+    fn push(&mut self, event: Event) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+
+        if self.entries.len() == TOUCH_TRACE_CAPACITY {
+            // Reuse the slot the popped entry owned rather than allocating.
+            self.entries.pop_front();
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(Timestamp { secs: 0, nanos: 0 }, Timestamp::from);
+        self.entries.push_back(TouchTraceEntry {
+            sequence,
+            timestamp,
+            event,
+        });
+    }
+
+    /// Entries strictly newer than `since`, oldest first.
+    fn since(&self, since: u64) -> TouchTrace {
+        TouchTrace {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| entry.sequence > since)
+                .cloned()
+                .collect(),
+            next_sequence: self.next_sequence,
+        }
+    }
+}
+
+/// Record one touch event in the ring, and decide whether it also goes to the
+/// live event stream.
+///
+/// The ring is written first and unconditionally; `broadcast` only controls the
+/// stream. Splitting it this way is what keeps
+/// [`Request::TouchTrace`] useful in a session that never set
+/// `NIRI_IPC_TOUCH_TRACE=1`, while the stream stays opt-in.
+fn record_touch_event(ring: &mut TouchTraceRing, event: Event, broadcast: bool) -> Option<Event> {
+    ring.push(event.clone());
+    broadcast.then_some(event)
+}
+
 pub struct IpcServer {
     /// Path to the IPC socket.
     ///
@@ -49,6 +126,26 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    /// Bounded history of the touch events, for late-attaching clients.
+    ///
+    /// Shared with the request handlers so that [`Request::TouchTrace`] can
+    /// read it; `Rc<RefCell<…>>` like the other IPC server state, and touched
+    /// only from the main loop thread, so the borrow can never deadlock
+    /// against the event-stream emit path (which is also main-loop only).
+    touch_trace: Rc<RefCell<TouchTraceRing>>,
+    /// Whether to broadcast the touch-arbitration events on the event stream.
+    ///
+    /// Unlike the gesture events, which are per-bind opt-in, arbitration
+    /// decisions happen on every finger-down and there is nothing per-bind to
+    /// attach them to: a gesture that never gets recognised has no bind to
+    /// ask for it. Since the *stream* exists for debugging and can flood a
+    /// real subscriber with one line per finger-down, it is gated on an
+    /// environment variable read once at startup.
+    ///
+    /// This gates the live stream only. The [`Self::touch_trace`] ring buffer
+    /// is populated unconditionally, so [`Request::TouchTrace`] works in any
+    /// session, including one that never set the variable.
+    pub trace_touch_arbitration: bool,
 }
 
 struct ClientCtx {
@@ -57,6 +154,7 @@ struct ClientCtx {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    touch_trace: Rc<RefCell<TouchTraceRing>>,
 }
 
 struct EventStreamClient {
@@ -110,6 +208,8 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            touch_trace: Rc::new(RefCell::new(TouchTraceRing::new())),
+            trace_touch_arbitration: env::var_os("NIRI_IPC_TOUCH_TRACE").is_some_and(|x| x == "1"),
         })
     }
 
@@ -173,6 +273,7 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
         ipc_outputs: state.backend.ipc_outputs(),
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
+        touch_trace: ipc_server.touch_trace.clone(),
     };
 
     let future = async move {
@@ -455,6 +556,10 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::TouchTrace { since } => {
+            let ring = ctx.touch_trace.borrow();
+            Response::TouchTrace(ring.since(since))
         }
     };
 
@@ -982,5 +1087,350 @@ impl State {
         let event = Event::ScreenshotCaptured { path };
         state.apply(event.clone());
         server.send_event(event);
+    }
+
+    /// Announce that a touchscreen gesture has started.
+    ///
+    /// Purely informational: this never fires the gesture's bind. It is
+    /// only ever called for a bind configured with `emit-progress true`.
+    pub fn ipc_touch_gesture_begin(
+        &mut self,
+        trigger: String,
+        finger_count: u8,
+        displacement: f64,
+    ) {
+        self.ipc_touch_event(
+            Event::TouchGestureBegin {
+                trigger,
+                finger_count,
+                displacement,
+            },
+            true,
+        );
+    }
+
+    /// Report live progress of a touchscreen gesture.
+    pub fn ipc_touch_gesture_update(
+        &mut self,
+        trigger: String,
+        progress_delta: f64,
+        progress: f64,
+        velocity: f64,
+        displacement: f64,
+    ) {
+        self.ipc_touch_event(
+            Event::TouchGestureUpdate {
+                trigger,
+                progress_delta,
+                progress,
+                velocity,
+                displacement,
+            },
+            true,
+        );
+    }
+
+    /// Report that a touchscreen gesture has finished.
+    pub fn ipc_touch_gesture_end(
+        &mut self,
+        trigger: String,
+        progress: f64,
+        committed: bool,
+        displacement: f64,
+    ) {
+        self.ipc_touch_event(
+            Event::TouchGestureEnd {
+                trigger,
+                progress,
+                committed,
+                displacement,
+            },
+            true,
+        );
+    }
+
+    /// The single place a touch event is published.
+    ///
+    /// Every one of the six touch [`Event`] variants goes through here, so the
+    /// event-stream clients and the [`Request::TouchTrace`] ring buffer can
+    /// never see different events: there is exactly one publish point, and it
+    /// writes both.
+    ///
+    /// `broadcast` gates only the live event stream, never the ring buffer.
+    /// The ring is always populated, so a client can recover evidence from a
+    /// session that was never started with `NIRI_IPC_TOUCH_TRACE=1` — which is
+    /// the only case worth recovering evidence for, since you cannot know in
+    /// advance which session will misbehave. The stream is the part that can
+    /// flood a real subscriber with one line per finger-down, so it stays
+    /// opt-in.
+    ///
+    /// None of these events is state that a newly connected client needs
+    /// replayed, so `EventStreamState::apply` passes them straight through; it
+    /// is still called so that a future state part gets a chance to see them.
+    fn ipc_touch_event(&mut self, event: Event, broadcast: bool) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        // Cheap: one clone into a pre-reserved slot, no allocation and no
+        // lock (the ring is main-loop-only, like the rest of the server state).
+        // The ring is written whether or not the stream is gated; that is what
+        // keeps `Request::TouchTrace` useful without `NIRI_IPC_TOUCH_TRACE=1`.
+        let Some(event) =
+            record_touch_event(&mut server.touch_trace.borrow_mut(), event, broadcast)
+        else {
+            return;
+        };
+
+        let mut state = server.event_stream_state.borrow_mut();
+        state.apply(event.clone());
+        server.send_event(event);
+    }
+
+    /// Publish one touch-ownership decision, if the trace is enabled.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one field per documented event field"
+    )]
+    pub fn ipc_touch_arbitration_decision(
+        &mut self,
+        slot: u32,
+        ownership: TouchOwnership,
+        rule: String,
+        finger_count: u32,
+        arming_eligible: u32,
+        open_client_touches: u32,
+        sequence_compositor_owned: bool,
+        is_pen: bool,
+        pos_x: f64,
+        pos_y: f64,
+    ) {
+        self.ipc_touch_event(
+            Event::TouchArbitrationDecision {
+                slot,
+                ownership,
+                rule,
+                finger_count,
+                arming_eligible,
+                open_client_touches,
+                sequence_compositor_owned,
+                is_pen,
+                pos_x,
+                pos_y,
+            },
+            self.touch_trace_enabled(),
+        );
+    }
+
+    /// Publish the retirement of one contact from the touch ledger.
+    pub fn ipc_touch_slot_retired(&mut self, slot: u32, was_tracked: bool) {
+        self.ipc_touch_event(
+            Event::TouchSlotRetired { slot, was_tracked },
+            self.touch_trace_enabled(),
+        );
+    }
+
+    /// Publish a wholesale clear of the touch ledger.
+    pub fn ipc_touch_sequence_reset(&mut self, open_client_touches: u32, live_contacts: u32) {
+        self.ipc_touch_event(
+            Event::TouchSequenceReset {
+                open_client_touches,
+                live_contacts,
+            },
+            self.touch_trace_enabled(),
+        );
+    }
+
+    /// Whether the compositor was started with the touch trace enabled.
+    fn touch_trace_enabled(&self) -> bool {
+        self.niri
+            .ipc_server
+            .as_ref()
+            .is_some_and(|server| server.trace_touch_arbitration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(slot: u32) -> Event {
+        Event::TouchArbitrationDecision {
+            slot,
+            ownership: TouchOwnership::Compositor,
+            rule: "8_arming".to_string(),
+            finger_count: 3,
+            arming_eligible: 3,
+            open_client_touches: 0,
+            sequence_compositor_owned: false,
+            is_pen: false,
+            pos_x: 100.0 + slot as f64,
+            pos_y: 200.0,
+        }
+    }
+
+    fn slot_of(entry: &TouchTraceEntry) -> u32 {
+        match entry.event {
+            Event::TouchArbitrationDecision { slot, .. } => slot,
+            _ => panic!("not an arbitration decision"),
+        }
+    }
+
+    #[test]
+    fn touch_trace_ring_is_empty_at_start() {
+        let ring = TouchTraceRing::new();
+        let trace = ring.since(0);
+        assert!(trace.entries.is_empty());
+        assert_eq!(trace.next_sequence, 1);
+    }
+
+    #[test]
+    fn touch_trace_ring_sequences_are_monotonic_from_one() {
+        let mut ring = TouchTraceRing::new();
+        for slot in 0..5 {
+            ring.push(event(slot));
+        }
+
+        let trace = ring.since(0);
+        assert_eq!(
+            trace.entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(trace.next_sequence, 6);
+    }
+
+    #[test]
+    fn touch_trace_ring_since_filters_strictly_greater() {
+        let mut ring = TouchTraceRing::new();
+        for slot in 0..5 {
+            ring.push(event(slot));
+        }
+
+        // `since` is exclusive: an entry with exactly this sequence was already seen.
+        assert!(ring.since(5).entries.is_empty());
+
+        let trace = ring.since(3);
+        assert_eq!(
+            trace.entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        // next_sequence is the overall high-water mark, not derived from `since`.
+        assert_eq!(trace.next_sequence, 6);
+    }
+
+    #[test]
+    fn touch_trace_ring_bounds_at_capacity_and_drops_oldest() {
+        let mut ring = TouchTraceRing::new();
+        let overflow = 10;
+        let total = TOUCH_TRACE_CAPACITY + overflow;
+        for slot in 0..total {
+            ring.push(event(slot as u32));
+        }
+
+        let trace = ring.since(0);
+        assert_eq!(trace.entries.len(), TOUCH_TRACE_CAPACITY);
+        assert_eq!(trace.next_sequence, total as u64 + 1);
+
+        // The oldest `overflow` entries are the ones dropped: what is left is
+        // exactly the tail of the stream, oldest first.
+        assert_eq!(
+            trace.entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            (overflow as u64 + 1..=total as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            trace.entries.iter().map(slot_of).collect::<Vec<_>>(),
+            (overflow as u32..total as u32).collect::<Vec<_>>()
+        );
+
+        // A `since` older than the buffer still returns the whole buffer, never
+        // more than capacity, and never panics.
+        assert_eq!(ring.since(0).entries.len(), TOUCH_TRACE_CAPACITY);
+        assert_eq!(
+            ring.since(u64::MAX).entries.len(),
+            0,
+            "a client ahead of the compositor gets nothing back"
+        );
+    }
+
+    /// The regression that matters: the ring must be populated even with
+    /// `NIRI_IPC_TOUCH_TRACE` unset.
+    ///
+    /// A cargo test run has no env var set, so this is exactly the ordinary
+    /// session that the ring exists for. If `broadcast` were allowed to skip
+    /// the ring, `Request::TouchTrace` would return `[]` in every session that
+    /// did not opt in — inert by default, and useless for the only case worth
+    /// debugging (the faulting session you did not predict).
+    #[test]
+    fn touch_trace_ring_is_populated_with_the_env_var_unset() {
+        assert!(
+            env::var_os("NIRI_IPC_TOUCH_TRACE").is_none(),
+            "this test asserts the untraced path; do not run it with the env var set"
+        );
+
+        let mut ring = TouchTraceRing::new();
+
+        // broadcast = false is exactly what `touch_trace_enabled()` returns
+        // when the env var is unset.
+        let streamed = record_touch_event(&mut ring, event(1), false);
+        assert!(
+            streamed.is_none(),
+            "with the trace off the event must not reach the live stream"
+        );
+
+        // ...but it is still in the ring.
+        let trace = ring.since(0);
+        assert_eq!(
+            trace.entries.len(),
+            1,
+            "the ring must record even with the stream gated off"
+        );
+        assert_eq!(slot_of(&trace.entries[0]), 1);
+        assert_eq!(trace.next_sequence, 2);
+    }
+
+    /// The other half of the split: with the trace on, the stream still gets
+    /// the event. The stream gate must not have been broken in fixing the ring.
+    #[test]
+    fn touch_trace_ring_still_broadcasts_when_the_env_var_is_set() {
+        let mut ring = TouchTraceRing::new();
+
+        let streamed = record_touch_event(&mut ring, event(2), true);
+        assert!(
+            streamed.is_some(),
+            "with the trace on the event must still reach the live stream"
+        );
+        assert_eq!(ring.since(0).entries.len(), 1);
+    }
+
+    /// Ring and stream see the same events, because both are written from the
+    /// one publish function — there is no path that reaches one and not the
+    /// other, whichever way the gate is set.
+    #[test]
+    fn ring_and_stream_never_disagree() {
+        for broadcast in [false, true] {
+            let mut ring = TouchTraceRing::new();
+            let mut streamed = Vec::new();
+
+            for slot in 0..4 {
+                if let Some(event) = record_touch_event(&mut ring, event(slot), broadcast) {
+                    streamed.push(event);
+                }
+            }
+
+            let entries = ring.since(0).entries;
+            assert_eq!(entries.len(), 4, "ring saw a different set");
+            assert_eq!(
+                streamed.len(),
+                if broadcast { 4 } else { 0 },
+                "the stream saw the wrong number of events for broadcast={broadcast}"
+            );
+            for (entry, event) in entries.iter().map(|e| &e.event).zip(&streamed) {
+                assert_eq!(
+                    serde_json::to_string(entry).unwrap(),
+                    serde_json::to_string(event).unwrap(),
+                    "ring and stream disagreed on the event contents"
+                );
+            }
+        }
     }
 }

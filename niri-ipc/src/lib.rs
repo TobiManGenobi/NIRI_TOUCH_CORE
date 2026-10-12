@@ -119,6 +119,28 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Read back buffered touch-trace events.
+    ///
+    /// The touch events on the event stream are push-only: a client that
+    /// connects after a gesture has already misbehaved has missed them. The
+    /// compositor keeps a bounded ring buffer of the most recent touch events
+    /// and this request reads it back, so a client can poll incrementally.
+    /// The ring is always populated — it does not require
+    /// `NIRI_IPC_TOUCH_TRACE=1` or any per-bind `emit-progress` flag. Those
+    /// gate the live event stream only. So this works in an ordinary session,
+    /// which is what makes it useful: you cannot know in advance which session
+    /// will misbehave.
+    ///
+    /// `since` is the highest sequence number the client has already seen
+    /// (0 for a client that has seen nothing). Only entries with a strictly
+    /// greater sequence number are returned, oldest first.
+    ///
+    /// This is deliberately a short recent history, not a replay log: entries
+    /// are dropped once the buffer is full.
+    TouchTrace {
+        /// Highest sequence number the client has already seen.
+        since: u64,
+    },
 }
 
 /// Reply from niri to client.
@@ -165,6 +187,10 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// A read-back of buffered touch-trace events.
+    ///
+    /// See [`Request::TouchTrace`].
+    TouchTrace(TouchTrace),
 }
 
 /// Overview information.
@@ -1606,6 +1632,82 @@ pub enum CastTarget {
     },
 }
 
+/// Number of touch-trace entries the compositor keeps in its ring buffer.
+///
+/// The ring is **always populated**: it is a fixed-size in-memory buffer, so
+/// keeping it filled is free and works in every session. `NIRI_IPC_TOUCH_TRACE=1`
+/// gates only the *live event stream*, never this buffer. See [`TouchTrace`].
+pub const TOUCH_TRACE_CAPACITY: usize = 256;
+
+/// One buffered touch-trace event.
+///
+/// Identical to the [`Event`] that was also pushed on the event stream, with
+/// the metadata a late-attaching client cannot otherwise recover: where it
+/// falls in the sequence, and when it happened.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct TouchTraceEntry {
+    /// Monotonically increasing, starts at 1, never reused.
+    ///
+    /// Pass this back as [`Request::TouchTrace::since`] to poll incrementally.
+    pub sequence: u64,
+    /// When the event was published, as [`Timestamp`].
+    pub timestamp: Timestamp,
+    /// The touch event itself.
+    pub event: Event,
+}
+
+/// Buffered touch events, oldest first.
+///
+/// The compositor keeps at most [`TOUCH_TRACE_CAPACITY`] of these in a ring
+/// buffer. This is current state plus a short recent history, deliberately
+/// *not* full replay: the interesting failure has already happened by the time
+/// a debugging tool is attached, so the last few hundred events are what
+/// explain it, and an unbounded log would be an unbounded memory cost on a
+/// path that runs on every finger-down.
+///
+/// **The ring is populated unconditionally.** It does not depend on
+/// `NIRI_IPC_TOUCH_TRACE` or on any per-bind `emit-progress` flag: an empty
+/// response means no touch activity has happened since the compositor started,
+/// nothing else. That env var gates only the live event stream, because the
+/// stream can flood a real subscriber with one line per finger-down; the ring
+/// has no subscriber to flood and nobody reads it unless a client asks.
+///
+/// The consequence is the point of this type: a debugging tool can recover
+/// evidence from a session that was never configured for tracing, which is the
+/// only session whose evidence anyone ever wants. The evidence does not survive
+/// a compositor restart, since the buffer is in-memory.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct TouchTrace {
+    /// Entries newer than the requested `since`, oldest first.
+    ///
+    /// This is capped at [`TOUCH_TRACE_CAPACITY`] entries.
+    pub entries: Vec<TouchTraceEntry>,
+    /// The highest sequence number the compositor has issued.
+    ///
+    /// A client polling with `since` set to this value gets only events that
+    /// happened after this response. Note that the buffer may have wrapped in
+    /// the meantime, in which case events older than this have been dropped.
+    pub next_sequence: u64,
+}
+
+/// Who owns a touch contact, as decided by the compositor's arbitration.
+///
+/// Only `Compositor` contacts reach the gesture recognizer; `Client` contacts
+/// are forwarded verbatim to the focused surface; `Ignored` contacts go
+/// nowhere at all.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum TouchOwnership {
+    /// The compositor owns the contact and feeds it to the gesture recognizer.
+    Compositor,
+    /// The client owns the contact and receives it as a normal touch.
+    Client,
+    /// The contact is inert: neither the compositor nor the client sees it.
+    Ignored,
+}
+
 /// A compositor event.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1745,6 +1847,239 @@ pub enum Event {
     CastStopped {
         /// Stream ID of the stopped screencast.
         stream_id: u64,
+    },
+    /// A touchscreen gesture was recognised and has begun.
+    ///
+    /// Only sent for binds configured with `emit-progress true`. This event
+    /// does not fire the bind; it only announces that the gesture is live.
+    TouchGestureBegin {
+        /// The config trigger the gesture matched, e.g. `TouchSwipe`.
+        ///
+        /// This is the trigger of the bind carrying `emit-progress true`
+        /// that the gesture resolved to, which is what ties the begin event
+        /// to the updates and the end event that follow it.
+        trigger: String,
+        /// Number of contacts driving the gesture.
+        finger_count: u8,
+        /// Displacement of the gesture along its locked axis, at the moment
+        /// the gesture was recognised, in the gesture's own unit.
+        ///
+        /// See [`TouchGestureUpdate::displacement`] for the per-kind units;
+        /// the value here is the recognizer's own reading at begin time, so
+        /// it is typically small but not necessarily zero.
+        displacement: f64,
+    },
+    /// A touchscreen gesture advanced.
+    ///
+    /// Only sent for binds configured with `emit-progress true`. Sent once
+    /// per input frame in which the gesture's progress changed.
+    TouchGestureUpdate {
+        /// The config trigger the gesture matched, same as on
+        /// [`TouchGestureBegin::trigger`].
+        trigger: String,
+        /// Change in `progress` since the previous update.
+        ///
+        /// The first update of a gesture measures from the begin event, where
+        /// progress was already whatever the recognizer reported, so this is
+        /// `progress - progress_at_begin` for the first update and
+        /// `progress - previous_progress` thereafter. May be negative: the
+        /// user can pull the gesture back.
+        progress_delta: f64,
+        /// Normalised completion of the gesture, in `0.0..=1.0`.
+        ///
+        /// `1.0` is the point at which the gesture has crossed the
+        /// threshold that fires its bind, so a bind's action runs as soon as
+        /// progress reaches `1.0`. An overlay that draws a threshold marker
+        /// should place it at the right-hand end of the track.
+        progress: f64,
+        /// Rate of change of `progress`, in units of progress per second.
+        ///
+        /// Computed from the compositor's frame timestamps, so it is noisy
+        /// at high frame rates; an overlay should smooth it rather than plot
+        /// it raw.
+        velocity: f64,
+        /// Displacement of the gesture along its locked axis, in the
+        /// gesture's own unit.
+        ///
+        /// The field is deliberately NOT named for a unit, because it does not
+        /// have one: the recognizer measures each kind in whatever unit that
+        /// kind moves in, and this field passes that number through unchanged
+        /// rather than converting it.
+        ///
+        /// - `swipe`, `edge-swipe`, `corner-swipe`: **pixels** travelled along the locked axis.
+        ///   Signed for `swipe` (positive means travelling in the locked direction), non-negative
+        ///   for the edge and corner variants.
+        /// - `pinch`: **pixels** of spread change; positive is divergence.
+        /// - `rotate`: **radians** of rotation, always non-negative. This is the one kind that is
+        ///   not measured in pixels, so a consumer must not plot it on a pixel-valued track.
+        /// - `tap` and `tap-hold`: `0.0`. Neither has a continuous extent, so the recognizer
+        ///   reports no displacement for them — the same reason their `progress` is reported as
+        ///   `1.0`.
+        ///
+        /// Use it for the raw gesture extent an overlay draws; `progress` is the
+        /// normalised form of the same quantity. Because the unit varies by
+        /// kind, a consumer must know the gesture kind before plotting this —
+        /// the kind is recoverable from the `trigger` string.
+        displacement: f64,
+    },
+    /// A touchscreen gesture finished.
+    ///
+    /// Only sent for binds configured with `emit-progress true`. Always the
+    /// last event of a gesture, whether or not it was committed.
+    TouchGestureEnd {
+        /// The config trigger the gesture matched, same as on
+        /// [`TouchGestureBegin::trigger`].
+        trigger: String,
+        /// Final normalised completion, in `0.0..=1.0`.
+        progress: f64,
+        /// Whether the gesture reached its threshold and fired its bind.
+        ///
+        /// This is exactly the flag the gesture recognizer reports as
+        /// `completed`: a gesture the user abandoned below threshold, or one
+        /// the recognizer cancelled, reports `false` and fires nothing.
+        committed: bool,
+        /// Final displacement of the gesture along its locked axis, in the
+        /// gesture's own unit.
+        ///
+        /// Same per-kind units as [`TouchGestureUpdate::displacement`],
+        /// including `0.0` for `tap` and `tap-hold`.
+        displacement: f64,
+    },
+    /// One touch-ownership decision was made.
+    ///
+    /// This is the *why* behind the gesture events: the compositor decides,
+    /// on every finger-down, whether that finger belongs to the compositor or
+    /// to the client, and only fingers it keeps ever reach the gesture
+    /// recognizer. A gesture that never appears on the stream is usually a
+    /// decision you want to read back here.
+    ///
+    /// Only sent when the compositor was started with
+    /// `NIRI_IPC_TOUCH_TRACE=1`, because it fires on every touch contact
+    /// rather than only on gestures.
+    ///
+    /// # Reading a trace
+    ///
+    /// Three situations account for nearly every touchscreen bug, and each
+    /// has its own shape in this stream:
+    ///
+    /// - **The gesture never began, and no single decision looks wrong.** Read `arming_eligible`
+    ///   across the whole sequence: it stops below `min_gesture_fingers`. Something in the
+    ///   sequence is being excluded — a pen tip, an exclusion rect, a passthrough window — and
+    ///   `finger_count` being larger than `arming_eligible` is the tell.
+    /// - **A decision armed the compositor (`rule: "8_arming"`) and the client then stopped
+    ///   responding to touch.** That decision's `open_client_touches` counts the contacts the
+    ///   client still believes are down; they must have been closed at the seat. If they were not,
+    ///   the client is holding phantom fingers and no later touch will reach it. This is the
+    ///   failure the trace exists to make visible.
+    /// - **A slot never gets retired.** A `TouchSlotRetired` for every `TouchArbitrationDecision`
+    ///   is a healthy sequence end. A decision with no retirement means the ledger still counts a
+    ///   finger that lifted, and it keeps inflating `arming_eligible` for every later contact —
+    ///   which is how a phantom gesture arms out of nowhere. A `TouchSequenceReset` is the escape
+    ///   hatch: it wipes the inflated tally, so a trace that goes wrong and then fixes itself on
+    ///   the next action is the signature of a stale slot.
+    TouchArbitrationDecision {
+        /// Backend slot id of the contact this decision is about.
+        ///
+        /// The same id that appears on [`TouchSlotRetired::slot`]; a decision
+        /// with no matching retirement is a contact the compositor never saw
+        /// lift.
+        slot: u32,
+        /// Who owns the contact.
+        ownership: TouchOwnership,
+        /// Which precedence rule decided it.
+        ///
+        /// This is the same string niri logs as `rule=` at debug level, taken
+        /// from the same function, so the log and the event can never
+        /// disagree. `"8_arming"` means this contact is the one that armed
+        /// the compositor; `"2_pen_draws"` means it was a pen; `"9_sequence_ownership_client"`
+        /// means it joined a sequence the client already owned and stayed
+        /// with the client.
+        rule: String,
+        /// Contacts in this sequence at decision time, including this one.
+        ///
+        /// The sequence is the ledger's unit, so a pen that drew earlier in
+        /// the same touch sequence is counted here even though it does not
+        /// count toward arming. That difference between this and
+        /// `arming_eligible` is usually the explanation for a gesture that
+        /// did not fire.
+        finger_count: u32,
+        /// Contacts in this sequence that count toward arming a gesture.
+        ///
+        /// Pen tips, contacts inside an exclusion rect, and contacts on a
+        /// passthrough window never count. Compare against
+        /// `min_gesture_fingers` to see how close this sequence came to
+        /// arming.
+        arming_eligible: u32,
+        /// Client-visible touches the ledger held at decision time.
+        ///
+        /// These are contacts already forwarded to the client and still
+        /// believed down by it. A non-zero value on a `Compositor` decision
+        /// is the interesting case: those contacts have just been taken away
+        /// from the client and must have been closed at the seat, or the
+        /// client keeps a phantom finger down and stops responding to the
+        /// user.
+        open_client_touches: u32,
+        /// Whether an earlier contact in this sequence already belonged to
+        /// the compositor.
+        sequence_compositor_owned: bool,
+        /// Whether the contact came from a pen.
+        ///
+        /// A pen normally draws (`2_pen_draws`) unless Mod is held, in which
+        /// case it is a gesture input like any other (`4_mod_is_the_escape_hatch`).
+        is_pen: bool,
+        /// Global logical x of the contact that produced this decision.
+        ///
+        /// This is the position at which the contact landed and at which
+        /// the decision was made, in GLOBAL LOGICAL PIXELS — the same
+        /// coordinate space as every other position niri reports, so an
+        /// overlay can place it against the output layout directly. It is
+        /// NOT relative to the output the contact landed on.
+        ///
+        /// This is a per-down value, not a live-updating position: it is the
+        /// position at the moment of the decision and never changes
+        /// afterwards. To follow a contact as it moves, read the gesture
+        /// events instead.
+        pos_x: f64,
+        /// Global logical y of the contact that produced this decision.
+        ///
+        /// See [`TouchArbitrationDecision::pos_x`] for the coordinate space
+        /// and for why this is a per-down value rather than a live one.
+        pos_y: f64,
+    },
+    /// A contact was retired from the touch ledger.
+    ///
+    /// Emitted both on an ordinary lift and on a lift the ledger did not
+    /// recognise. Only sent when the compositor was started with
+    /// `NIRI_IPC_TOUCH_TRACE=1`.
+    TouchSlotRetired {
+        /// Backend slot id that was retired.
+        slot: u32,
+        /// Whether the ledger actually still held the slot.
+        ///
+        /// `false` means the lift arrived for a contact the ledger had
+        /// already forgotten, which is the signature of a stale ledger or an
+        /// out-of-order event pair.
+        was_tracked: bool,
+    },
+    /// The touch ledger was cleared wholesale.
+    ///
+    /// Fired for the paths that end contacts without naming them: a yanked
+    /// touch device, the last touch device going away, the seat-wide touch
+    /// cancel, the global cancel at the start of every action, and output
+    /// reconfiguration. Everything the ledger knew is gone at this point, so
+    /// no further retirements will arrive for the slots it held. Only sent
+    /// when the compositor was started with `NIRI_IPC_TOUCH_TRACE=1`.
+    TouchSequenceReset {
+        /// Client-visible touches the ledger held immediately before the
+        /// clear.
+        ///
+        /// A client still believes these are down. This is normal for the
+        /// global cancel that runs before every action; combined with a
+        /// gesture that then never completes, it is the thing to look at.
+        open_client_touches: u32,
+        /// Contacts the compositor believed were on the glass immediately
+        /// before the clear.
+        live_contacts: u32,
     },
 }
 
@@ -2170,5 +2505,271 @@ mod tests {
         );
         assert!("-".parse::<PositionChange>().is_err());
         assert!("10% ".parse::<PositionChange>().is_err());
+    }
+
+    /// Pins the wire format of the gesture-progress events.
+    ///
+    /// An external overlay is written against these exact JSON strings, so
+    /// the expected output is spelled out literally rather than derived from
+    /// the types: renaming a field or a variant has to fail here.
+    #[test]
+    fn touch_gesture_event_json_round_trip() {
+        let events = [
+            (
+                Event::TouchGestureBegin {
+                    trigger: "TouchSwipe fingers=3 direction=\"left\"".to_string(),
+                    finger_count: 3,
+                    displacement: 12.5,
+                },
+                r#"{"TouchGestureBegin":{"trigger":"TouchSwipe fingers=3 direction=\"left\"","finger_count":3,"displacement":12.5}}"#,
+            ),
+            (
+                Event::TouchGestureUpdate {
+                    trigger: "TouchSwipe fingers=3 direction=\"left\"".to_string(),
+                    progress_delta: 0.25,
+                    progress: 0.75,
+                    velocity: 1.5,
+                    displacement: 140.0,
+                },
+                r#"{"TouchGestureUpdate":{"trigger":"TouchSwipe fingers=3 direction=\"left\"","progress_delta":0.25,"progress":0.75,"velocity":1.5,"displacement":140.0}}"#,
+            ),
+            (
+                Event::TouchGestureEnd {
+                    trigger: "TouchSwipe fingers=3 direction=\"left\"".to_string(),
+                    progress: 1.0,
+                    committed: true,
+                    displacement: 187.5,
+                },
+                r#"{"TouchGestureEnd":{"trigger":"TouchSwipe fingers=3 direction=\"left\"","progress":1.0,"committed":true,"displacement":187.5}}"#,
+            ),
+        ];
+
+        for (event, expected) in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(json, expected);
+
+            // And back again, so a client that speaks this JSON is served by
+            // the same enum rather than by a lookalike.
+            let parsed: Event = serde_json::from_str(&json).unwrap();
+            match (&event, &parsed) {
+                (
+                    Event::TouchGestureBegin {
+                        trigger,
+                        finger_count,
+                        displacement,
+                    },
+                    Event::TouchGestureBegin {
+                        trigger: trigger2,
+                        finger_count: finger_count2,
+                        displacement: displacement2,
+                    },
+                ) => {
+                    assert_eq!(trigger, trigger2);
+                    assert_eq!(finger_count, finger_count2);
+                    assert_eq!(displacement, displacement2);
+                    assert!(*displacement > 0.0, "begin carries a non-zero displacement");
+                }
+                (
+                    Event::TouchGestureUpdate {
+                        trigger,
+                        progress_delta,
+                        progress,
+                        velocity,
+                        displacement,
+                    },
+                    Event::TouchGestureUpdate {
+                        trigger: trigger2,
+                        progress_delta: progress_delta2,
+                        progress: progress2,
+                        velocity: velocity2,
+                        displacement: displacement2,
+                    },
+                ) => {
+                    assert_eq!(trigger, trigger2);
+                    assert_eq!(progress_delta, progress_delta2);
+                    assert_eq!(progress, progress2);
+                    assert_eq!(velocity, velocity2);
+                    assert_eq!(displacement, displacement2);
+                    assert!(
+                        *displacement > 0.0,
+                        "update carries a non-zero displacement"
+                    );
+                }
+                (
+                    Event::TouchGestureEnd {
+                        trigger,
+                        progress,
+                        committed,
+                        displacement,
+                    },
+                    Event::TouchGestureEnd {
+                        trigger: trigger2,
+                        progress: progress2,
+                        committed: committed2,
+                        displacement: displacement2,
+                    },
+                ) => {
+                    assert_eq!(trigger, trigger2);
+                    assert_eq!(progress, progress2);
+                    assert_eq!(committed, committed2);
+                    assert_eq!(displacement, displacement2);
+                    assert!(*displacement > 0.0, "end carries a non-zero displacement");
+                }
+                _ => panic!("round-tripped into a different variant"),
+            }
+        }
+    }
+
+    /// Pins the wire format of the touch-arbitration trace, including the
+    /// rule-name field: it is a free-form string today, and this is what
+    /// keeps the compositor and a 2am debugging session agreeing on it.
+    #[test]
+    fn touch_arbitration_event_json_round_trip() {
+        let events = [
+            (
+                Event::TouchArbitrationDecision {
+                    slot: 7,
+                    ownership: TouchOwnership::Compositor,
+                    rule: "8_arming".to_string(),
+                    finger_count: 3,
+                    arming_eligible: 2,
+                    open_client_touches: 2,
+                    sequence_compositor_owned: false,
+                    is_pen: false,
+                    pos_x: 1234.5,
+                    pos_y: -678.25,
+                },
+                r#"{"TouchArbitrationDecision":{"slot":7,"ownership":"Compositor","rule":"8_arming","finger_count":3,"arming_eligible":2,"open_client_touches":2,"sequence_compositor_owned":false,"is_pen":false,"pos_x":1234.5,"pos_y":-678.25}}"#,
+            ),
+            (
+                Event::TouchArbitrationDecision {
+                    slot: 0,
+                    ownership: TouchOwnership::Client,
+                    rule: "2_pen_draws".to_string(),
+                    finger_count: 1,
+                    arming_eligible: 0,
+                    open_client_touches: 1,
+                    sequence_compositor_owned: false,
+                    is_pen: true,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                },
+                r#"{"TouchArbitrationDecision":{"slot":0,"ownership":"Client","rule":"2_pen_draws","finger_count":1,"arming_eligible":0,"open_client_touches":1,"sequence_compositor_owned":false,"is_pen":true,"pos_x":0.0,"pos_y":0.0}}"#,
+            ),
+            (
+                Event::TouchSlotRetired {
+                    slot: 7,
+                    was_tracked: true,
+                },
+                r#"{"TouchSlotRetired":{"slot":7,"was_tracked":true}}"#,
+            ),
+            (
+                Event::TouchSequenceReset {
+                    open_client_touches: 2,
+                    live_contacts: 3,
+                },
+                r#"{"TouchSequenceReset":{"open_client_touches":2,"live_contacts":3}}"#,
+            ),
+        ];
+
+        for (event, expected) in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(json, expected);
+
+            let parsed: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                expected,
+                "{event:?} did not survive a round trip"
+            );
+        }
+    }
+
+    /// Pins the wire format of the touch-trace read-back request.
+    ///
+    /// A late-attaching debugging client is written against these exact bytes,
+    /// so the request is spelled out as literal JSON the way the event tests
+    /// spell out their events.
+    #[test]
+    fn touch_trace_request_json_round_trip() {
+        for (json, expected) in [
+            (
+                r#"{"TouchTrace":{"since":0}}"#,
+                Request::TouchTrace { since: 0 },
+            ),
+            (
+                r#"{"TouchTrace":{"since":42}}"#,
+                Request::TouchTrace { since: 42 },
+            ),
+        ] {
+            let parsed: Request = serde_json::from_str(json).unwrap();
+            match (&parsed, &expected) {
+                (Request::TouchTrace { since }, Request::TouchTrace { since: since2 }) => {
+                    assert_eq!(since, since2);
+                }
+                _ => panic!("parsed into a different variant"),
+            }
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
+    }
+
+    /// Pins the wire format of the touch-trace read-back response, including
+    /// the empty-ring case a client hits before anything has happened.
+    #[test]
+    fn touch_trace_response_json_round_trip() {
+        let responses = [
+            (
+                Response::TouchTrace(TouchTrace {
+                    entries: Vec::new(),
+                    next_sequence: 1,
+                }),
+                r#"{"TouchTrace":{"entries":[],"next_sequence":1}}"#,
+            ),
+            (
+                Response::TouchTrace(TouchTrace {
+                    entries: vec![TouchTraceEntry {
+                        sequence: 7,
+                        timestamp: Timestamp {
+                            secs: 3,
+                            nanos: 500_000_000,
+                        },
+                        event: Event::TouchArbitrationDecision {
+                            slot: 7,
+                            ownership: TouchOwnership::Compositor,
+                            rule: "8_arming".to_string(),
+                            finger_count: 3,
+                            arming_eligible: 2,
+                            open_client_touches: 2,
+                            sequence_compositor_owned: false,
+                            is_pen: false,
+                            pos_x: 1234.5,
+                            pos_y: -678.25,
+                        },
+                    }],
+                    next_sequence: 8,
+                }),
+                concat!(
+                    r#"{"TouchTrace":{"entries":[{"sequence":7,"#,
+                    r#""timestamp":{"secs":3,"nanos":500000000},"#,
+                    r#""event":{"TouchArbitrationDecision":{"slot":7,"#,
+                    r#""ownership":"Compositor","rule":"8_arming","#,
+                    r#""finger_count":3,"arming_eligible":2,"#,
+                    r#""open_client_touches":2,"sequence_compositor_owned":false,"#,
+                    r#""is_pen":false,"pos_x":1234.5,"pos_y":-678.25}}}],"next_sequence":8}}"#,
+                ),
+            ),
+        ];
+
+        for (response, expected) in responses {
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(json, expected);
+
+            let parsed: Response = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                expected,
+                "{response:?} did not survive a round trip"
+            );
+        }
     }
 }

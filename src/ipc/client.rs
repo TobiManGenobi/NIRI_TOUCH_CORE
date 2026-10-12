@@ -522,6 +522,79 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                     Event::CastStopped { stream_id } => {
                         println!("Cast stopped: stream id {stream_id}");
                     }
+                    Event::TouchGestureBegin {
+                        trigger,
+                        finger_count,
+                        displacement,
+                    } => {
+                        println!(
+                            "Touch gesture began: {trigger} \
+                            ({finger_count} fingers, displacement {displacement:+.3})"
+                        );
+                    }
+                    Event::TouchGestureUpdate {
+                        trigger,
+                        progress_delta,
+                        progress,
+                        velocity,
+                        displacement,
+                    } => {
+                        println!(
+                            "Touch gesture progress: {trigger} \
+                            {progress:.2} ({progress_delta:+.3}, {velocity:+.2}/s, \
+                            displacement {displacement:+.3})"
+                        );
+                    }
+                    Event::TouchGestureEnd {
+                        trigger,
+                        progress,
+                        committed,
+                        displacement,
+                    } => {
+                        let how = if committed { "committed" } else { "cancelled" };
+                        println!(
+                            "Touch gesture ended: {trigger} {how} at {progress:.2} \
+                            (displacement {displacement:+.3})"
+                        );
+                    }
+                    Event::TouchArbitrationDecision {
+                        slot,
+                        ownership,
+                        rule,
+                        finger_count,
+                        arming_eligible,
+                        open_client_touches,
+                        sequence_compositor_owned,
+                        is_pen,
+                        pos_x,
+                        pos_y,
+                    } => {
+                        println!(
+                            "Touch ownership: slot {slot} -> {ownership:?} \
+                            by {rule} \
+                            ({finger_count} down, {arming_eligible} arming, \
+                            {open_client_touches} open client touches, \
+                            sequence_compositor_owned: {sequence_compositor_owned}, \
+                            pen: {is_pen}, at {pos_x:.1},{pos_y:.1})"
+                        );
+                    }
+                    Event::TouchSlotRetired { slot, was_tracked } => {
+                        let tracked = if was_tracked {
+                            ""
+                        } else {
+                            " (was not tracked)"
+                        };
+                        println!("Touch slot retired: {slot}{tracked}");
+                    }
+                    Event::TouchSequenceReset {
+                        open_client_touches,
+                        live_contacts,
+                    } => {
+                        println!(
+                            "Touch ledger reset: {open_client_touches} open client touches, \
+                            {live_contacts} live contacts"
+                        );
+                    }
                 }
             }
         }

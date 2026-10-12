@@ -126,6 +126,10 @@ pub struct ResolvedWindowRules {
     /// Override whether to set the Tiled xdg-toplevel state on the window.
     pub tiled_state: Option<bool>,
 
+    /// Let touch gestures pass through to this window's client instead of
+    /// being claimed by the compositor (L3's `under_gesture_app` flag).
+    pub touchscreen_gesture_passthrough: bool,
+
     /// Background effect configuration.
     pub background_effect: BackgroundEffect,
 
@@ -314,6 +318,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.tiled_state {
                     resolved.tiled_state = Some(x);
+                }
+                if let Some(x) = rule.touchscreen_gesture_passthrough {
+                    resolved.touchscreen_gesture_passthrough = x;
                 }
 
                 resolved

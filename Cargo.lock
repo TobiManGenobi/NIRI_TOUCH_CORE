@@ -2250,6 +2250,8 @@ dependencies = [
  "serde_json",
  "smithay",
  "smithay-drm-extras",
+ "touch-arbitrate",
+ "touch-core",
  "tracing",
  "tracing-subscriber",
  "tracy-client",
@@ -3741,6 +3743,17 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "touch-arbitrate"
+version = "0.1.0"
+dependencies = [
+ "touch-core",
+]
+
+[[package]]
+name = "touch-core"
+version = "0.1.0"
 
 [[package]]
 name = "tracing"

@@ -563,6 +563,16 @@ fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
         Trigger::TabletStylusButton1 => String::from("Tablet Stylus Button 1"),
         Trigger::TabletStylusButton2 => String::from("Tablet Stylus Button 2"),
         Trigger::TabletStylusButton3 => String::from("Tablet Stylus Button 3"),
+        Trigger::TouchpadSwipe { .. }
+        | Trigger::TouchpadPinch { .. }
+        | Trigger::TouchpadTapHold { .. }
+        | Trigger::TouchpadTapHoldDrag { .. }
+        | Trigger::TouchSwipe { .. }
+        | Trigger::TouchPinch { .. }
+        | Trigger::TouchRotate { .. }
+        | Trigger::TouchTap { .. }
+        | Trigger::TouchTapHoldDrag { .. }
+        | Trigger::TouchEdge { .. } => String::from("Touch Gesture"),
     };
     name.push_str(&pretty);
 

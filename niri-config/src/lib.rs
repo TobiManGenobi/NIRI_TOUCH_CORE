@@ -50,7 +50,10 @@ pub use crate::binds::*;
 pub use crate::debug::Debug;
 pub use crate::error::{ConfigIncludeError, ConfigParseResult};
 pub use crate::gestures::Gestures;
-pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocusMode, Xkb};
+pub use crate::input::{
+    zone_kdl_name, EdgeZone, Input, ModKey, ScreenEdge, ScrollMethod, Touchscreen,
+    TouchscreenGesturesConfig, TrackLayout, WarpMouseToFocusMode, Xkb,
+};
 pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
 pub use crate::misc::*;
@@ -742,7 +745,7 @@ mod tests {
                                        4.0 5.0 6.0
                 }
 
-                touch {
+                touchscreen {
                     map-to-output "eDP-1"
                 }
 
@@ -1144,12 +1147,13 @@ mod tests {
                     map_to_focused_window: true,
                     left_handed: false,
                 },
-                touch: Touch {
+                touchscreen: Touchscreen {
                     off: false,
                     calibration_matrix: None,
                     map_to_output: Some(
                         "eDP-1",
                     ),
+                    gestures: None,
                 },
                 disable_power_key_handling: true,
                 warp_mouse_to_focus: Some(
@@ -1916,6 +1920,7 @@ mod tests {
                         ),
                     ),
                     tiled_state: None,
+                    touchscreen_gesture_passthrough: None,
                     background_effect: BackgroundEffectRule {
                         xray: None,
                         blur: None,
@@ -2006,6 +2011,7 @@ mod tests {
                                 "Inhibit",
                             ),
                         ),
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2022,6 +2028,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2042,6 +2049,7 @@ mod tests {
                         allow_when_locked: true,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2060,6 +2068,7 @@ mod tests {
                         hotkey_overlay_title: Some(
                             None,
                         ),
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2076,6 +2085,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2094,6 +2104,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2110,6 +2121,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2128,6 +2140,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2146,6 +2159,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2162,6 +2176,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2182,6 +2197,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2202,6 +2218,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2220,6 +2237,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2236,6 +2254,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2254,6 +2273,7 @@ mod tests {
                         allow_when_locked: true,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                 ],
             ),
@@ -2380,6 +2400,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2402,6 +2423,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                     Bind {
                         key: Key {
@@ -2426,6 +2448,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        emit_progress: false,
                     },
                 ],
             },
@@ -2509,6 +2532,418 @@ mod tests {
         -                0.6666666666666666,
         +                0.66667,
         "#,
+        );
+    }
+
+    #[test]
+    fn parse_touch_gesture_binds() {
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="up" { close-overview; }
+                TouchSwipe fingers=4 direction="down" { toggle-overview; }
+                TouchPinch fingers=3 direction="in" { focus-column-left; }
+                TouchRotate fingers=4 direction="cw" { focus-column-left; }
+                TouchTap fingers=3 { noop; }
+                TouchTapHoldDrag fingers=3 { move-window-to-floating; }
+                TouchTapHoldDrag fingers=4 direction="left" { toggle-window-floating; }
+                TouchEdge edge="left" { focus-monitor-left; }
+                TouchEdge edge="top" zone="right" { close-window; }
+                TouchpadSwipe fingers=3 direction="up" { close-overview; }
+                TouchpadPinch fingers=2 direction="in" { focus-column-left; }
+                TouchpadTapHold fingers=3 { close-window; }
+                TouchpadTapHoldDrag fingers=3 { move-window-to-floating; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let triggers: Vec<_> = config.binds.0.iter().map(|b| b.key.trigger).collect();
+        assert!(triggers.contains(&Trigger::TouchSwipe {
+            fingers: 3,
+            direction: SwipeDirection::Up,
+        }));
+        assert!(triggers.contains(&Trigger::TouchSwipe {
+            fingers: 4,
+            direction: SwipeDirection::Down,
+        }));
+        assert!(triggers.contains(&Trigger::TouchPinch {
+            fingers: 3,
+            direction: PinchDirection::In,
+        }));
+        assert!(triggers.contains(&Trigger::TouchRotate {
+            fingers: 4,
+            direction: RotateDirection::Cw,
+        }));
+        assert!(triggers.contains(&Trigger::TouchTap { fingers: 3 }));
+        assert!(triggers.contains(&Trigger::TouchTapHoldDrag {
+            fingers: 3,
+            direction: None,
+        }));
+        assert!(triggers.contains(&Trigger::TouchTapHoldDrag {
+            fingers: 4,
+            direction: Some(SwipeDirection::Left),
+        }));
+        assert!(triggers.contains(&Trigger::TouchEdge {
+            edge: ScreenEdge::Left,
+            zone: None,
+        }));
+        assert!(triggers.contains(&Trigger::TouchEdge {
+            edge: ScreenEdge::Top,
+            zone: Some(EdgeZone::End),
+        }));
+        assert!(triggers.contains(&Trigger::TouchpadSwipe {
+            fingers: 3,
+            direction: SwipeDirection::Up,
+        }));
+        assert!(triggers.contains(&Trigger::TouchpadPinch {
+            fingers: 2,
+            direction: PinchDirection::In,
+        }));
+        assert!(triggers.contains(&Trigger::TouchpadTapHold { fingers: 3 }));
+        assert!(triggers.contains(&Trigger::TouchpadTapHoldDrag { fingers: 3 }));
+
+        // The `noop` body is a real action, so the bind consumes the gesture
+        // without doing anything.
+        assert!(config.binds.0.iter().any(|b| b.action == Action::Noop));
+    }
+
+    #[test]
+    fn emit_progress_parses_on_every_touch_trigger() {
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" emit-progress=true { close-overview; }
+                TouchPinch fingers=3 direction="in" emit-progress=true { close-overview; }
+                TouchRotate fingers=3 direction="cw" emit-progress=true { close-overview; }
+                TouchTap fingers=3 emit-progress=true { close-overview; }
+                TouchTapHoldDrag fingers=3 direction="left" emit-progress=true { close-overview; }
+                TouchEdge edge="left" zone="center" emit-progress=true { close-overview; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.binds.0.len(), 6);
+        for bind in &config.binds.0 {
+            assert!(
+                bind.emit_progress,
+                "{:?} should have progress emission on",
+                bind.key.trigger
+            );
+        }
+    }
+
+    #[test]
+    fn emit_progress_is_allowed_on_touchpad_triggers_too() {
+        // Same reasoning as any other gesture trigger: the property means
+        // "publish the progress of the gesture this bind matches", and a
+        // touchpad swipe is a gesture just as much as a touchscreen one.
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchpadSwipe fingers=3 direction="up" emit-progress=true { close-overview; }
+                TouchpadPinch fingers=2 direction="in" emit-progress=true { close-overview; }
+                TouchpadTapHold fingers=3 emit-progress=true { close-overview; }
+                TouchpadTapHoldDrag fingers=3 emit-progress=true { close-overview; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.binds.0.len(), 4);
+        assert!(config.binds.0.iter().all(|bind| bind.emit_progress));
+    }
+
+    #[test]
+    fn emit_progress_bare_flag_is_rejected_like_every_other_bool() {
+        // KDL rejects a bare identifier where a value belongs, so
+        // `emit-progress` on its own never reaches the decoder at all. That
+        // is exactly how `repeat`, `allow-when-locked` and `natural-scroll`
+        // behave: the value must be spelled `emit-progress=true`.
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" emit-progress { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("identifiers cannot be used as arguments"),
+            "unexpected error: {msg}"
+        );
+
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" repeat { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("identifiers cannot be used as arguments"),
+            "an existing boolean property behaves differently"
+        );
+    }
+
+    #[test]
+    fn emit_progress_false_stays_off() {
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" emit-progress=false { close-overview; }
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(!config.binds.0[0].emit_progress);
+    }
+
+    #[test]
+    fn emit_progress_defaults_to_false() {
+        // A bind without the property must be untouched by this feature:
+        // same trigger, same action, no emission.
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" { close-overview; }
+            }
+            "#,
+        )
+        .unwrap();
+        let bind = &config.binds.0[0];
+        assert!(!bind.emit_progress);
+        assert_eq!(
+            bind.key.trigger,
+            Trigger::TouchSwipe {
+                fingers: 3,
+                direction: SwipeDirection::Left,
+            }
+        );
+        assert_eq!(bind.action, Action::CloseOverview);
+    }
+
+    #[test]
+    fn emit_progress_rejects_garbage() {
+        // Quoted, so it survives KDL and reaches the decoder's `bool` decode,
+        // which is where this error message comes from.
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="left" emit-progress="garbage" { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("expected bool"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn touch_gesture_rejects_bad_finger_count() {
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=2 direction="up" { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("fingers=2 out of range (valid range 3..=10)"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn touch_gesture_rejects_wrong_family_direction() {
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="in" { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("invalid direction=\"in\"") && msg.contains("expected up|down|left|right"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn touch_gesture_rejects_unknown_property() {
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe fingers=3 direction="up" wobble=7 { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unexpected property `wobble`"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn touch_gesture_rejects_bare_family_name() {
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                TouchSwipe { close-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("requires `fingers=N`"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn touchscreen_gestures_tuning_parses_with_defaults() {
+        let config = Config::parse_mem("").unwrap();
+        let ts = &config.input.touchscreen;
+        assert_eq!(ts.swipe_trigger_distance(), 100.0);
+        assert_eq!(ts.edge_start_distance(), 12.0);
+        assert_eq!(ts.pinch_trigger_distance(), 100.0);
+        assert_eq!(ts.rotation_trigger_angle(), 20f64.to_radians());
+        assert_eq!(ts.tap_wobble_threshold(), 15.0);
+        assert_eq!(ts.tap_timeout_ms(), 500.0);
+    }
+
+    #[test]
+    fn touchscreen_gestures_tuning_overrides_defaults() {
+        let config = Config::parse_mem(
+            r#"
+            input {
+                touchscreen {
+                    gestures {
+                        swipe-trigger-distance 60
+                        edge-start-distance 8
+                        pinch-trigger-distance 75
+                        rotation-trigger-angle 30
+                        tap-wobble-threshold 5
+                        tap-timeout-ms 250
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let ts = &config.input.touchscreen;
+        assert_eq!(ts.swipe_trigger_distance(), 60.0);
+        assert_eq!(ts.edge_start_distance(), 8.0);
+        assert_eq!(ts.pinch_trigger_distance(), 75.0);
+        assert_eq!(ts.rotation_trigger_angle(), 30f64.to_radians());
+        assert_eq!(ts.tap_wobble_threshold(), 5.0);
+        assert_eq!(ts.tap_timeout_ms(), 250.0);
+    }
+
+    #[test]
+    fn touch_edge_lookup_prefers_zoned_then_falls_back() {
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                TouchEdge edge="left" { close-window; }
+                TouchEdge edge="left" zone="top" { close-overview; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let exact = config
+            .binds
+            .find_touch_edge(ScreenEdge::Left, Some(EdgeZone::Start))
+            .unwrap();
+        assert_eq!(exact.action, Action::CloseOverview);
+
+        // A zone with no zoned bind falls back to the unzoned edge bind.
+        let fallback = config
+            .binds
+            .find_touch_edge(ScreenEdge::Left, Some(EdgeZone::Center))
+            .unwrap();
+        assert_eq!(fallback.action, Action::CloseWindow);
+
+        // Corners carry no third, so they use the same unzoned fallback.
+        let corner = config
+            .binds
+            .find_touch_edge(ScreenEdge::Left, None)
+            .unwrap();
+        assert_eq!(corner.action, Action::CloseWindow);
+
+        // No bind on that edge at all.
+        assert!(config
+            .binds
+            .find_touch_edge(ScreenEdge::Bottom, Some(EdgeZone::Start))
+            .is_none());
+    }
+
+    #[test]
+    fn min_gesture_fingers_defaults_to_min_fingers() {
+        // Unset must equal MIN_FINGERS so any bindable gesture can arm.
+        let config = Config::parse_mem("").unwrap();
+        assert_eq!(
+            config.input.touchscreen.min_gesture_fingers(),
+            MIN_FINGERS as u32
+        );
+        assert_eq!(config.input.touchscreen.min_gesture_fingers(), 3);
+    }
+
+    #[test]
+    fn min_gesture_fingers_overrides_default() {
+        let config = Config::parse_mem(
+            r#"
+            input {
+                touchscreen {
+                    gestures {
+                        min-gesture-fingers 4
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.input.touchscreen.min_gesture_fingers(), 4);
+    }
+
+    #[test]
+    fn min_gesture_fingers_rejects_out_of_range() {
+        // 0 would arm on a single touch, stealing all client input; >10
+        // exceeds MAX_FINGERS so no bind could ever be reachable.
+        for bad in ["0", "1", "11"] {
+            let res = Config::parse_mem(&format!(
+                "input {{ touchscreen {{ gestures {{ min-gesture-fingers {bad} }} }} }}"
+            ));
+            assert!(res.is_err(), "min-gesture-fingers {bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn touch_gesture_passthrough_window_rule_parses() {
+        let config = Config::parse_mem(
+            r#"
+            window-rule {
+                match app-id="com.example.App"
+                touchscreen-gesture-passthrough true
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.window_rules.len(), 1);
+        assert_eq!(
+            config.window_rules[0].touchscreen_gesture_passthrough,
+            Some(true)
         );
     }
 }

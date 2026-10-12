@@ -37,6 +37,7 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
+use wayland_client::protocol::wl_touch::{self, WlTouch};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
 use crate::utils::id::IdCounter;
@@ -101,17 +102,36 @@ pub struct LayerSurface {
 #[derive(Debug, Default)]
 pub struct Seat {
     pub keyboard: Option<Keyboard>,
+    pub touch: Option<Touch>,
+}
+
+/// One touch contact the compositor reported to the client.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchEvent {
+    Down { slot: u32, x: f64, y: f64 },
+    Motion { slot: u32, x: f64, y: f64 },
+    Up { slot: u32 },
+    Frame,
+    Cancel,
 }
 
 #[derive(Debug)]
 pub struct Surface {
     pub keyboard_events_received: Vec<KeyboardEvent>,
     pub keyboard_events_looked_at: usize,
+    pub touch_events_received: Vec<TouchEvent>,
+    pub touch_events_looked_at: usize,
 }
 
 #[derive(Debug)]
 pub struct Keyboard {
     pub proxy: WlKeyboard,
+    pub surface: Option<WlSurface>,
+}
+
+#[derive(Debug)]
+pub struct Touch {
+    pub proxy: WlTouch,
     pub surface: Option<WlSurface>,
 }
 
@@ -337,6 +357,8 @@ impl State {
             Surface {
                 keyboard_events_received: Vec::new(),
                 keyboard_events_looked_at: 0,
+                touch_events_received: Vec::new(),
+                touch_events_looked_at: 0,
             },
         );
         surface
@@ -423,6 +445,18 @@ impl State {
     ) -> impl Iterator<Item = &KeyboardEvent> + '_ {
         let surface = self.surfaces.get_mut(surface).unwrap();
         surface.recent_keyboard_events()
+    }
+
+    /// The touch contacts the compositor has sent to `surface` since this was
+    /// last called, draining them.
+    pub fn recent_touch_events(
+        &mut self,
+        surface: &WlSurface,
+    ) -> impl Iterator<Item = TouchEvent> + '_ {
+        let surface = self.surfaces.get_mut(surface).unwrap();
+        let start = surface.touch_events_looked_at;
+        surface.touch_events_looked_at = surface.touch_events_received.len();
+        surface.touch_events_received[start..].iter().copied()
     }
 
     pub fn inhibit_shortcuts(&self, surface: &WlSurface) -> ZwpKeyboardShortcutsInhibitorV1 {
@@ -720,6 +754,20 @@ impl Dispatch<WlSeat, ()> for State {
                         keyboard.proxy.release();
                     }
                 }
+
+                if capabilities.contains(wl_seat::Capability::Touch) {
+                    if data.touch.is_none() {
+                        let touch = Touch {
+                            proxy: seat.get_touch(qh, seat.clone()),
+                            surface: None,
+                        };
+                        data.touch = Some(touch);
+                    }
+                } else {
+                    if let Some(touch) = data.touch.take() {
+                        touch.proxy.release();
+                    }
+                }
             }
             wl_seat::Event::Name { .. } => (),
             _ => unreachable!(),
@@ -789,6 +837,82 @@ impl Dispatch<WlKeyboard, WlSeat> for State {
                 surface.keyboard_events_received.push(event);
             }
             wl_keyboard::Event::RepeatInfo { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlTouch, WlSeat> for State {
+    fn event(
+        state: &mut Self,
+        _touch: &WlTouch,
+        event: <WlTouch as wayland_client::Proxy>::Event,
+        seat: &WlSeat,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // Touch is delivered per surface, so every event except cancel names
+        // the surface it applies to. Recording it the same way keyboard
+        // events are recorded lets a test ask "what did the client see"
+        // without reaching into the compositor.
+        let seat = state.seats.get_mut(seat).unwrap();
+        let touch = seat.touch.as_mut().unwrap();
+
+        match event {
+            wl_touch::Event::Down {
+                surface, id, x, y, ..
+            } => {
+                touch.surface = Some(surface.clone());
+                state
+                    .surfaces
+                    .get_mut(&surface)
+                    .unwrap()
+                    .touch_events_received
+                    .push(TouchEvent::Down {
+                        slot: id as u32,
+                        x,
+                        y,
+                    });
+            }
+            wl_touch::Event::Up { id, .. } => {
+                let surface = touch.surface.clone().unwrap();
+                state
+                    .surfaces
+                    .get_mut(&surface)
+                    .unwrap()
+                    .touch_events_received
+                    .push(TouchEvent::Up { slot: id as u32 });
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                let surface = touch.surface.clone().unwrap();
+                state
+                    .surfaces
+                    .get_mut(&surface)
+                    .unwrap()
+                    .touch_events_received
+                    .push(TouchEvent::Motion {
+                        slot: id as u32,
+                        x,
+                        y,
+                    });
+            }
+            wl_touch::Event::Frame => {
+                let surface = touch.surface.clone().unwrap();
+                state
+                    .surfaces
+                    .get_mut(&surface)
+                    .unwrap()
+                    .touch_events_received
+                    .push(TouchEvent::Frame);
+            }
+            wl_touch::Event::Cancel => {
+                // A cancel ends the whole session; record it against every
+                // surface that saw a contact so a test draining one surface
+                // still sees it.
+                for surface in state.surfaces.values_mut() {
+                    surface.touch_events_received.push(TouchEvent::Cancel);
+                }
+            }
             _ => unreachable!(),
         }
     }

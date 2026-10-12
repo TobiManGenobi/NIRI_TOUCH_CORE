@@ -2,7 +2,7 @@
 
 In this section you can configure input devices like keyboard and mouse, and some input-related options.
 
-There's a section for each device type: `keyboard`, `touchpad`, `mouse`, `trackpoint`, `trackball`, `tablet`, `touch`.
+There's a section for each device type: `keyboard`, `touchpad`, `mouse`, `trackpoint`, `trackball`, `tablet`, `touchscreen`.
 Settings in those sections will apply to every device of that type.
 Currently, there's no way to configure specific devices individually (but that is planned).
 
@@ -96,10 +96,20 @@ input {
         // calibration-matrix 1.0 0.0 0.0 0.0 1.0 0.0
     }
 
-    touch {
+    touchscreen {
         // off
         map-to-output "eDP-1"
         // calibration-matrix 1.0 0.0 0.0 0.0 1.0 0.0
+        // gestures {
+        //     min-gesture-fingers 3
+        //     exclusion-rects 1280 720 0 0
+        //     swipe-trigger-distance 100
+        //     edge-start-distance 12
+        //     pinch-trigger-distance 100
+        //     rotation-trigger-angle 20
+        //     tap-wobble-threshold 15
+        //     tap-timeout-ms 500
+        // }
     }
 
     // disable-power-key-handling
@@ -262,11 +272,11 @@ Settings specific to `touchpad` and `mouse`:
 
     <sup>Since: 25.08</sup> You can also override horizontal and vertical scroll factor separately like so: `scroll-factor horizontal=2.0 vertical=-1.0`
 
-Settings specific to `tablet` and `touch`:
+Settings specific to `tablet` and `touchscreen`:
 
 - `calibration-matrix`: set to six floating point numbers to change the calibration matrix. See the [`LIBINPUT_CALIBRATION_MATRIX` documentation](https://wayland.freedesktop.org/libinput/doc/latest/device-configuration-via-udev.html) for examples.
     - <sup>Since: 25.02</sup> for `tablet`
-    - <sup>Since: 25.11</sup> for `touch`
+    - <sup>Since: 25.11</sup> for `touchscreen` (this node was called `touch` until it was renamed; `touch { }` is a parse error)
 
 Tablets and touchscreens are absolute pointing devices that can be mapped to a specific output like so:
 
@@ -276,7 +286,7 @@ input {
         map-to-output "eDP-1"
     }
 
-    touch {
+    touchscreen {
         map-to-output "eDP-1"
     }
 }
@@ -295,6 +305,116 @@ Falls back to those when no window is focused (for example, in the overview).
 
     When the tablet is also mapped to a specific output via `map-to-output`, the `map-to-focused-window` flag will map the tablet to the active window on that output.
     If the tablet isn't mapped to any specific output, it will map the tablet to the current focused window regardless of where it is.
+
+#### Touchscreen Gestures
+
+<sup>Since: next release</sup>
+
+Settings specific to `touchscreen`:
+
+- `gestures { ... }`: tunes when the compositor claims a touchscreen sequence, and where it declines to. See [Touchscreen Gestures](#touchscreen-gestures) below.
+
+##### `exclusion-rects`
+
+Rectangles inside which the compositor's touchscreen gestures are suppressed, and touches are always forwarded to the client.
+This is the L3 shape of Android's `systemGestureExclusionRects`: a region of the screen where a compositor gesture must not fire, so that a video player, a drawing app or a map can own the area without the compositor guessing from an app-id match.
+
+Each rectangle is four arguments in the order `w h x y`, meaning "a box this big, at this position".
+The coordinates are **global logical pixels**, the same space as a touch-down's position: the origin is the top-left corner of the bounding box of all outputs, and each output contributes its logical size at its `position` from the `outputs {}` block.
+A rect is therefore *not* per-output, and one authored for a single-monitor layout will be in the wrong place once a second monitor is added.
+
+Negative coordinates are legal and mean a monitor placed to the left of, or above, that origin.
+Each value must be between `-1000000` and `1000000`.
+Rects are half-open on the right and bottom edges, so two abutting rects partition the plane without both claiming the boundary.
+
+This is **one** node carrying a run of `w h x y` quadruples, not a repeated node.
+A run whose length is not a multiple of four is a hard parse error, and writing two `exclusion-rects` lines is rejected as well, since niri's config grammar disallows duplicate child nodes.
+
+```kdl
+input {
+    touchscreen {
+        gestures {
+            // Full-screen video player, plus a 400x300 region on a second
+            // monitor sitting to the right.
+            exclusion-rects 1280 720 0 0 400 300 1700 0
+        }
+    }
+}
+```
+
+##### Tuning knobs
+
+The other settings live in the same `gestures { ... }` block:
+
+- `min-gesture-fingers`: how many simultaneous contacts arm the compositor when the sequence did not start in an edge zone or under Mod. Valid values are from `2` to `10`, the default is `3`. Contacts below this count are forwarded to the client, so two-finger scroll/zoom passthrough keeps working. The value is rounded to the nearest whole number.
+- `swipe-trigger-distance`: pixels of centroid movement required before a swipe gesture latches. Lower values feel more responsive but risk triggering on incidental finger drift. The default is `100`.
+- `edge-start-distance`: width (in pixels) of the screen-edge start zone. A touch must *begin* within this distance from an edge for it to count as a `TouchEdge` gesture; touches starting farther in are treated as regular swipes. The default is `12`.
+- `pinch-trigger-distance`: pixels of `|spread_change|` required before a pinch gesture latches. The default is `100`.
+- `rotation-trigger-angle`: cumulative rotation (in **degrees**) required before a rotation gesture latches. Valid values are from `0` to `360`, the default is `20`.
+- `tap-wobble-threshold`: maximum per-finger displacement (in pixels) allowed during a tap gesture. If any single finger moves farther than this from its initial landing position, the tap candidate is killed and the gesture can only resolve as swipe/pinch/rotate. The default is `15`.
+- `tap-timeout-ms`: maximum duration (in milliseconds) from the first finger landing to all fingers lifting for a tap to fire. Taps slower than this are discarded. The default is `500`.
+
+##### Gesture Triggers
+
+The following bind triggers recognise touchscreen gestures.
+Each one takes its parameters as KDL properties on the bind, and all of them also accept the standard bind properties such as `repeat`, `cooldown-ms`, `allow-when-locked` and `emit-progress`.
+Modifiers work as usual, for example `Mod+TouchEdge edge="left"`.
+None of these families accepts an `edge=` or `zone=` property except `TouchEdge`, and none accepts `fingers=` except the five that need a finger count.
+
+`fingers=` is required for `TouchSwipe`, `TouchPinch`, `TouchRotate`, `TouchTap` and `TouchTapHoldDrag`, and must be from `3` to `10`.
+The floor of 3 exists so that two-finger client passthrough (scrolling and zooming) keeps working.
+
+```kdl
+binds {
+    // Three fingers swiped up: close the focused window.
+    Mod+TouchSwipe fingers=3 direction="up" { close-window; }
+
+    // Three fingers pinched outwards: widen the focused window.
+    Mod+TouchPinch fingers=3 direction="out" { switch-preset-window-width; }
+
+    // Three fingers rotated clockwise: take a screenshot.
+    Mod+TouchRotate fingers=3 direction="cw" { screenshot-screen; }
+
+    // Three fingers tapped: toggle the overview.
+    TouchTap fingers=3 { toggle-overview; }
+
+    // Three fingers, held then dragged in any direction: move a window.
+    // Add direction="up|down|left|right" to restrict the initial
+    // movement direction; without it the trigger is omnidirectional.
+    Mod+TouchTapHoldDrag fingers=3 { move-window-down; }
+
+    // A single-finger swipe starting within edge-start-distance of the
+    // bottom edge, in its centre third: switch to the workspace below.
+    Mod+TouchEdge edge="bottom" zone="center" { focus-workspace-down; }
+}
+```
+
+`TouchSwipe` requires `direction=`, which can be `up`, `down`, `left` or `right`.
+`TouchPinch` requires `direction=`, which can be `in` or `out`.
+`TouchRotate` requires `direction=`, which can be `cw` or `ccw`.
+`TouchTap` does not accept a `direction=`.
+
+`TouchTapHoldDrag` accepts an optional `direction=`; omitting it matches any direction.
+
+`TouchEdge` requires `edge=`, which can be `left`, `right`, `top` or `bottom`, and accepts an optional `zone=`.
+It does not accept `fingers=` or `direction=`.
+`zone=` picks one of the three thirds along the edge's perpendicular axis, and the vocabulary rotates with the edge: the `top` and `bottom` edges take `zone="left"|"center"|"right"`, while the `left` and `right` edges take `zone="top"|"center"|"bottom"`.
+When several binds match one gesture, a zoned bind is preferred over an unzoned one; an unzoned `TouchEdge` acts as the fallback for any zone.
+
+##### `emit-progress`
+
+Without it, a recognised gesture produces no IPC events at all.
+With `emit-progress true`, niri mirrors the recognised gesture onto the IPC event stream as `TouchGestureBegin`, `TouchGestureUpdate` and `TouchGestureEnd`, so an external overlay can draw live gesture progress.
+It gates only that event stream; it never causes the bind to fire twice.
+
+```kdl
+binds {
+    TouchSwipe fingers=3 direction="up" emit-progress=true { close-window; }
+}
+```
+
+Note that `emit-progress` is a property and takes a value: a bare `emit-progress` on its own is a syntax error, exactly like a bare `repeat` or `allow-when-locked`.
+
 
 ### General Settings
 

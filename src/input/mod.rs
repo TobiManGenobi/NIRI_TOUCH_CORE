@@ -15,7 +15,7 @@ use smithay::backend::input::{
     InputEvent, KeyState, KeyboardKeyEvent, Keycode, MouseButton, PointerAxisEvent,
     PointerButtonEvent, PointerMotionEvent, ProximityState, Switch, SwitchState, SwitchToggleEvent,
     TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
-    TabletToolTipState, TouchEvent,
+    TabletToolTipState, TouchEvent, TouchSlot,
 };
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
@@ -29,7 +29,8 @@ use smithay::input::pointer::{
 use smithay::input::tablet::tool::GrabStartData as TabletToolGrabStartData;
 use smithay::input::tablet::{TabletDescriptor, TabletSeatHandler, TabletSeatTrait};
 use smithay::input::touch::{
-    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, UpEvent,
+    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, TouchHandle,
+    UpEvent,
 };
 use smithay::input::{tablet, SeatHandler};
 use smithay::output::Output;
@@ -38,7 +39,10 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+use touch_arbitrate::Ownership;
+use touch_arbitration_grab::{recognizer_config, TouchArbitrationGrab, TouchDeviceInfo};
 use touch_overview_grab::TouchOverviewGrab;
+use tracing::debug;
 
 use self::move_grab::MoveGrab;
 use self::pick_color_grab::PickColorGrab;
@@ -65,6 +69,7 @@ pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
+pub mod touch_arbitration_grab;
 pub mod touch_overview_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
@@ -135,6 +140,7 @@ impl State {
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
         I::Device: 'static, // Needed for downcasting.
+        I::NiriDevice: TouchDeviceInfo,
     {
         let _span = tracy_client::span!("process_input_event");
 
@@ -252,9 +258,22 @@ impl State {
                 apply_libinput_settings(&self.niri.config.borrow().input, device);
             }
             InputEvent::DeviceRemoved { device } => {
-                self.niri.touch.remove(device);
+                let was_touch = self.niri.touch.remove(device);
                 self.niri.tablets.remove(device);
                 self.niri.devices.remove(device);
+
+                // A yanked touch device never delivers the `up` for the
+                // contacts it still held, so the sequence has to be closed
+                // wholesale. `on_device_removed` covers the seat teardown;
+                // this covers the raw libinput path, which can fire without
+                // the seat ever losing its touch capability — and that is the
+                // case where the grab is still installed, so the teardown has
+                // to be sequenced against it. See
+                // `touch_arbitration_grab::end_sequence_on_device_loss` for
+                // why clearing the ledgers on its own panics.
+                if was_touch {
+                    touch_arbitration_grab::end_sequence_on_device_loss(self);
+                }
             }
             _ => (),
         }
@@ -284,8 +303,15 @@ impl State {
                 tablet_seat.clear_tools();
             }
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
-            self.niri.seat.remove_touch();
+        if device.has_capability(DeviceCapability::Touch) {
+            // The last touch device is going away and any contacts it still
+            // had are never going to send an `up`. Clear the ownership ledger
+            // with them, or it keeps arming gestures for fingers that no
+            // longer exist.
+            if self.niri.touch.is_empty() {
+                self.niri.seat.remove_touch();
+                touch_arbitration_grab::reset_persistent_traced(self);
+            }
         }
     }
 
@@ -701,6 +727,9 @@ impl State {
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.cancel(self);
         }
+        // `touch.cancel` above ends every contact without naming them, so the
+        // persistent ownership ledger has to be cleared with it.
+        touch_arbitration_grab::reset_persistent_traced(self);
 
         match action {
             Action::Quit(skip_confirmation) => {
@@ -2428,6 +2457,8 @@ impl State {
                     self.niri.queue_redraw_mru_output();
                 }
             }
+            // The bind matched and consumed the gesture; nothing to do.
+            Action::Noop => {}
             Action::TestAction => {
                 #[cfg(test)]
                 {
@@ -3174,6 +3205,7 @@ impl State {
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
+                                emit_progress: false,
                             });
                             let bind_right = Some(Bind {
                                 key: Key {
@@ -3186,6 +3218,7 @@ impl State {
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
+                                emit_progress: false,
                             });
                             (bind_left, bind_right)
                         } else {
@@ -3243,6 +3276,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            emit_progress: false,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3255,6 +3289,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            emit_progress: false,
                         });
                         (bind_up, bind_down)
                     } else if should_handle_in_overview && modifiers == Modifiers::SHIFT {
@@ -3269,6 +3304,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            emit_progress: false,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3281,6 +3317,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            emit_progress: false,
                         });
                         (bind_up, bind_down)
                     } else {
@@ -4294,7 +4331,10 @@ impl State {
         self.compute_absolute_location(evt, self.niri.output_for_touch())
     }
 
-    fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent) {
+    fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent)
+    where
+        I::NiriDevice: TouchDeviceInfo,
+    {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
@@ -4312,7 +4352,237 @@ impl State {
         let mods = modifiers_from_state(mods);
         let mod_down = mods.contains(mod_key.to_modifiers());
 
-        if self.niri.screenshot_ui.is_open() {
+        // L3: ask the arbitrator who owns this touch, before anything else
+        // looks at it. This has to come first, ahead of the screenshot UI and
+        // the MRU, because those are clients too: a compositor-owned touch
+        // must never be routed into them.
+        //
+        // The gate below is "is *our* arbitration grab installed", NOT
+        // `handle.is_grabbed()`. Those are very different questions, and
+        // conflating them killed every mid-screen multi-finger swipe.
+        //
+        // smithay's `DefaultGrab` installs a `TouchDownGrab` on the first
+        // touch point of every sequence and keeps it until the last point
+        // lifts (documented at `Seat::add_touch`, `input/mod.rs:698-701`:
+        // "it will use `touch::DefaultGrab` which will install
+        // `touch::TouchDownGrab` on the first touch point"). So after the
+        // very first finger lands, `is_grabbed()` is permanently true for
+        // the rest of the sequence — including when nothing of ours is
+        // installed. Gating on it meant fingers two and three never reached
+        // `decide_persistent`, so `arming_eligible` could never exceed one,
+        // `min-gesture-fingers` was unreachable, and no multi-finger swipe
+        // could ever arm anywhere away from an edge.
+        //
+        // The gate exists for a real reason — a late-joining finger must not
+        // be arbitrated a second time by a grab that already owns the
+        // sequence — so it stays, but it now asks the question it actually
+        // means. See `TouchArbitrationGrab::owns_sequence`.
+        let touch_device = evt.device();
+        let touch_policy = touch_arbitration_grab::policy(&self.niri.config.borrow());
+        let down_ctx = touch_arbitration_grab::down_context(
+            self,
+            pos,
+            under.output.as_ref(),
+            mod_down,
+            touch_device.touch_device_info(),
+            &touch_policy,
+        );
+
+        // The live-contact ledger is a record of PHYSICS, not of ownership,
+        // so it is updated here — outside the arbitration gate — on every
+        // down that produced a `DownContext`.
+        //
+        // It has to be outside the gate. Sharing one condition with
+        // arbitration was the second half of the bug: `feed_sequence`
+        // reconstructs a sequence from `live_contacts()`, so a contact that
+        // is on the glass but unrecorded feeds the recogniser a *partial*
+        // sequence, which is the same failure mode reached by a different
+        // route. Suppressing the record whenever any grab happens to be
+        // installed would reintroduce it via the `MoveGrab` that the
+        // mod+touch-over-a-window branch installs, or any future grab.
+        //
+        // Both ownerships are recorded, client-owned contacts included —
+        // they have to be, since a mid-screen swipe only arms once the
+        // client already holds the earlier fingers. Recorded before the
+        // ownership branch, so `live_contacts()` mirrors the glass at
+        // arming time. See the invariant on `TOUCH_CONTACTS`.
+        let start_timestamp = Duration::from_micros(evt.time().micros());
+        touch_arbitration_grab::note_live_contact(
+            &down_ctx,
+            touch_arbitration_grab::slot_id(slot),
+            start_timestamp,
+        );
+
+        // A new sequence starts here, whatever this particular contact is
+        // going to be arbitrated as. The recognised-gesture test seam is
+        // cleared on ENTRY, not on exit: `reset_persistent` runs at the end
+        // of a sequence, after the recogniser has already dispatched the
+        // gesture, so clearing there would erase the value a test reads. See
+        // `touch_arbitration_grab::begin_sequence`.
+        touch_arbitration_grab::begin_sequence();
+
+        let touch_ownership = if Self::arbitration_grab_owns_sequence(&handle) {
+            None
+        } else {
+            // The persistent ledger, not a fresh one: a later finger can only
+            // arm the compositor because the arbitrator still remembers the
+            // earlier ones. See `TOUCH_ARBITRATOR`.
+            let (ownership, arbitrator, to_cancel, seq) = touch_arbitration_grab::decide_persistent(
+                &self.niri.config.borrow(),
+                touch_arbitration_grab::slot_id(slot),
+                &down_ctx,
+            );
+
+            // Why this touch landed where it did. The rule name is the
+            // numbered precedence step from `touch_arbitrate::decide`, so a
+            // surprising verdict points straight at the line of the contract
+            // that produced it. Debug-level: invisible in normal use, and
+            // exactly what `RUST_LOG=niri=debug` is for.
+            debug!(
+                slot = touch_arbitration_grab::slot_id(slot),
+                ownership = ?ownership,
+                rule = touch_arbitration_grab::rule_name(
+                    &down_ctx,
+                    &touch_policy,
+                    ownership,
+                    seq.compositor_owned,
+                    seq.arming_eligible,
+                ),
+                pos_x = down_ctx.pos.x,
+                pos_y = down_ctx.pos.y,
+                zone = ?down_ctx.zone,
+                passthrough_app = down_ctx.under_gesture_app,
+                mod_down,
+                pen = down_ctx.is_pen,
+                eraser = down_ctx.eraser,
+                in_exclusion_rect = down_ctx.in_exclusion_rect,
+                open_client_touches = touch_arbitration_grab::open_client_touches(),
+                arming_eligible = seq.arming_eligible,
+                "touch ownership decided"
+            );
+
+            touch_arbitration_grab::publish_arbitration_decision(
+                self,
+                &down_ctx,
+                &touch_policy,
+                ownership,
+                touch_arbitration_grab::slot_id(slot),
+                &seq,
+            );
+
+            if ownership == Ownership::Compositor {
+                // This finger just armed the compositor, but earlier fingers
+                // in the same sequence were already forwarded to the client.
+                // They MUST be closed on the seat, not merely dropped from
+                // the ledger: leaving them open is the phantom-touch bug
+                // verbatim (niri-tablet patch 0011) — the browser keeps a
+                // finger down, pinch-zooms, and then ignores every later tap.
+                //
+                // smithay's touch API has no per-slot cancel: `cancel` tears
+                // down the whole session, and `up` is the only per-slot
+                // teardown. A touch-end closes the client's finger just as a
+                // cancel does, which is the point — what must not happen is
+                // the client being left believing the finger is still down.
+                if !to_cancel.is_empty() {
+                    debug!(
+                        slot = touch_arbitration_grab::slot_id(slot),
+                        cancelled = ?to_cancel,
+                        "touch gesture armed; cancelling stranded client contacts"
+                    );
+                }
+                for stranded in to_cancel {
+                    let slot = TouchSlot::from(Some(stranded));
+                    handle.up(
+                        self,
+                        &UpEvent {
+                            slot,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: evt.time(),
+                        },
+                    );
+                }
+
+                // These touch-ends are SYNTHESISED: libinput never sent
+                // them. `wl_touch` delivers its events to the client inside
+                // a `wl_touch.frame`, and a close emitted without a
+                // following frame stays in the compositor's outbound
+                // buffer, undelivered.
+                //
+                // It works on glass only because libinput happens to frame
+                // after each input batch, so delivery of the phantom-touch
+                // fix would be contingent on an unrelated future event
+                // arriving. If the arming down is the last event in a batch
+                // and the user then lifts nothing for a while, the closes
+                // sit unflushed and the client keeps a phantom finger —
+                // exactly the failure this whole layer exists to prevent,
+                // reintroduced by a timing coincidence.
+                //
+                // So the flush is explicit and immediate. The client is
+                // told now, rather than whenever the next input event
+                // happens to turn up.
+                handle.frame(self);
+
+                let start_data = TouchGrabStartData {
+                    focus: None,
+                    slot,
+                    location: pos,
+                };
+                let start_data = AnyStartData::Touch(start_data);
+                // Overview is a continuous gesture with its own vehicle, one
+                // that also handles interactive move and workspace switching.
+                // Hand off to it rather than reimplementing overview
+                // detection here.
+                if self.niri.layout.is_overview_open()
+                    && under.layer.is_none()
+                    && under.output.is_some()
+                {
+                    let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
+                    let output = output.clone();
+
+                    let mut matched_narrow = true;
+                    let mut ws = self.niri.workspace_under(false, pos);
+                    if ws.is_none() {
+                        matched_narrow = false;
+                        ws = self.niri.workspace_under(true, pos);
+                    }
+                    let ws_id = ws.map(|(_, ws)| ws.id());
+
+                    let mapped = self.niri.window_under(pos);
+                    let window = mapped.map(|mapped| mapped.window.clone());
+
+                    let grab = TouchOverviewGrab::new(
+                        start_data,
+                        start_timestamp,
+                        output,
+                        pos_within_output,
+                        ws_id,
+                        matched_narrow,
+                        window,
+                    );
+                    handle.set_grab(self, grab, serial);
+                } else {
+                    let mut grab = TouchArbitrationGrab::new(
+                        start_data,
+                        arbitrator,
+                        slot,
+                        ownership,
+                        recognizer_config(&self.niri.config.borrow()),
+                    );
+                    // The whole sequence is already in the live ledger;
+                    // the recogniser gets every contact on the glass, not
+                    // just this finger.
+                    grab.feed_sequence();
+                    handle.set_grab(self, grab, serial);
+                }
+            }
+
+            Some(ownership)
+        };
+
+        if touch_ownership.is_none() {
+            // A grab is in charge of this sequence and has just decided this
+            // slot itself. Nothing below may run.
+        } else if self.niri.screenshot_ui.is_open() {
             // If we'll be moving the existing selection, use the selection output.
             let output = if mod_down {
                 self.niri.screenshot_ui.selection_output()
@@ -4347,44 +4617,8 @@ impl State {
                     self.niri.cancel_mru();
                 }
             }
-        } else if !handle.is_grabbed() {
-            if self.niri.layout.is_overview_open()
-                && !mod_down
-                && under.layer.is_none()
-                && under.output.is_some()
-            {
-                let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
-                let output = output.clone();
-
-                let mut matched_narrow = true;
-                let mut ws = self.niri.workspace_under(false, pos);
-                if ws.is_none() {
-                    matched_narrow = false;
-                    ws = self.niri.workspace_under(true, pos);
-                }
-                let ws_id = ws.map(|(_, ws)| ws.id());
-
-                let mapped = self.niri.window_under(pos);
-                let window = mapped.map(|mapped| mapped.window.clone());
-
-                let start_data = TouchGrabStartData {
-                    focus: None,
-                    slot,
-                    location: pos,
-                };
-                let start_data = AnyStartData::Touch(start_data);
-                let start_timestamp = Duration::from_micros(evt.time().micros());
-                let grab = TouchOverviewGrab::new(
-                    start_data,
-                    start_timestamp,
-                    output,
-                    pos_within_output,
-                    ws_id,
-                    matched_narrow,
-                    window,
-                );
-                handle.set_grab(self, grab, serial);
-            } else if let Some((window, _)) = under.window {
+        } else if touch_ownership == Some(Ownership::Client) {
+            if let Some((window, _)) = under.window {
                 self.niri.layout.activate_window(&window);
 
                 // Check if we need to start a touch move grab.
@@ -4410,7 +4644,7 @@ impl State {
                 self.niri.queue_redraw_all();
             }
             self.niri.focus_layer_surface_if_on_demand(under.layer);
-        };
+        }
 
         handle.down(
             self,
@@ -4432,6 +4666,25 @@ impl State {
         };
         let slot = evt.slot();
 
+        // Retire the slot from the persistent ownership ledger. Without this
+        // the ledger outlives the contact and its arming tally stays inflated
+        // forever. See the invariant on `TOUCH_ARBITRATOR`.
+        touch_arbitration_grab::release_slot_traced(self, touch_arbitration_grab::slot_id(slot));
+
+        // And from the live-contact ledger. Client-owned contacts are
+        // recorded on the way down — they have to be, or an arming
+        // decision cannot reconstruct a mid-screen start — so this lift is
+        // the only thing that removes them. Skipping it grows the ledger
+        // without bound and turns `live_contacts()` into a fiction that then
+        // mis-feeds every later `feed_sequence`. See the invariant on
+        // `TOUCH_CONTACTS`.
+        //
+        // Idempotent, and deliberately before the forward below: if a grab
+        // is installed its own `up` retires the same slot again, and the
+        // recogniser must not see the lifted finger in a later
+        // `feed_sequence`.
+        touch_arbitration_grab::forget_live_contact(touch_arbitration_grab::slot_id(slot));
+
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
                 self.confirm_screenshot(true);
@@ -4448,7 +4701,14 @@ impl State {
                 serial,
                 time: evt.time(),
             },
-        )
+        );
+
+        // A touch gesture can match a bind, and that action cannot be run
+        // from inside the grab: `do_action` starts by taking the seat's touch
+        // lock, which `with_grab` already holds, so running it inline
+        // deadlocks. `dispatch` queues instead; this is the drain, and it has
+        // to sit *after* `handle.up` returns, when the lock is released.
+        touch_arbitration_grab::flush_pending_actions(self);
     }
     fn on_touch_motion<I: InputBackend>(&mut self, evt: I::TouchMotionEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
@@ -4480,6 +4740,11 @@ impl State {
             },
         );
 
+        // Motion advances recognition, so it can be the event that completes
+        // a gesture and matches a bind. Drained here, after `handle.motion`
+        // returns and the touch lock is free. See `PENDING_ACTIONS`.
+        touch_arbitration_grab::flush_pending_actions(self);
+
         // Inform the layout of an ongoing DnD operation.
         let is_dnd_grab = handle
             .with_grab(|_, grab| Self::is_dnd_grab(grab.as_any()))
@@ -4496,12 +4761,21 @@ impl State {
             return;
         };
         handle.frame(self);
+
+        // Same reason as in `on_touch_up`: the grab may have matched a bind
+        // while advancing recognition, and the queue can only be drained once
+        // the touch lock is released.
+        touch_arbitration_grab::flush_pending_actions(self);
     }
     fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
         handle.cancel(self);
+
+        // A cancel ends every contact at once and tells us none of their
+        // ids, so the ledger is cleared wholesale.
+        touch_arbitration_grab::reset_persistent_traced(self);
     }
 
     fn on_switch_toggle<I: InputBackend>(&mut self, evt: I::SwitchToggleEvent) {
@@ -4523,6 +4797,35 @@ impl State {
         if let Some(action) = action {
             self.do_action(action, true);
         }
+    }
+
+    /// Whether the installed touch grab is *our* [`TouchArbitrationGrab`].
+    ///
+    /// This is deliberately not `handle.is_grabbed()`. Those two questions
+    /// look alike and behave nothing alike:
+    ///
+    /// * `is_grabbed()` is true whenever *any* grab is installed. smithay's `DefaultGrab` installs
+    ///   a `TouchDownGrab` on the first point of every sequence and keeps it until the last point
+    ///   lifts, so `is_grabbed()` is true for essentially the whole life of any touch sequence even
+    ///   when nothing of ours is installed.
+    /// * "Is our grab installed?" is true only between the moment the compositor arms and the
+    ///   moment that grab tears down.
+    ///
+    /// Gating arbitration on the first question meant the second and third
+    /// fingers of a plain-surface sequence never reached `decide_persistent`,
+    /// so the arming tally could never reach `min-gesture-fingers` and no
+    /// multi-finger swipe away from an edge could ever arm.
+    ///
+    /// Uses the same `with_grab` / `as_any()` / `is::<T>()` idiom as
+    /// [`Self::is_dnd_grab`] and [`Self::grab_can_be_cancelled_with_esc`]:
+    /// `with_grab` hands the closure `(Serial, &dyn TouchGrab<State>)`, and
+    /// `TouchGrab::as_any` is what turns that trait object into something
+    /// downcastable. `.unwrap_or(false)` covers "no grab installed", which is
+    /// the ordinary state between sequences and means the same thing here.
+    fn arbitration_grab_owns_sequence(handle: &TouchHandle<State>) -> bool {
+        handle
+            .with_grab(|_, grab| grab.as_any().is::<TouchArbitrationGrab>())
+            .unwrap_or(false)
     }
 
     pub fn is_dnd_grab(grab: &dyn Any) -> bool {
@@ -4600,6 +4903,7 @@ fn should_intercept_key<'a>(
                     // inhibited.
                     allow_inhibiting: false,
                     hotkey_overlay_title: None,
+                    emit_progress: false,
                 });
             }
         }
@@ -4666,6 +4970,7 @@ fn find_bind<'a>(
             // Hardcoded binds must never be inhibited.
             allow_inhibiting: false,
             hotkey_overlay_title: None,
+            emit_progress: false,
         });
     }
 
@@ -4903,6 +5208,7 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         allow_when_locked: false,
         allow_inhibiting: false,
         hotkey_overlay_title: None,
+        emit_progress: false,
     })
 }
 
@@ -5173,7 +5479,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
 
     let is_touch = device.has_capability(input::DeviceCapability::Touch);
     if is_touch {
-        let c = &config.touch;
+        let c = &config.touchscreen;
         let _ = device.config_send_events_set_mode(if c.off {
             input::SendEventsMode::DISABLED
         } else {
@@ -5333,6 +5639,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                emit_progress: false,
             },
             Bind {
                 key: Key {
@@ -5345,6 +5652,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                emit_progress: false,
             },
             Bind {
                 key: Key {
@@ -5357,6 +5665,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                emit_progress: false,
             },
             Bind {
                 key: Key {
@@ -5369,6 +5678,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                emit_progress: false,
             },
             Bind {
                 key: Key {
@@ -5381,6 +5691,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                emit_progress: false,
             },
         ]);
 

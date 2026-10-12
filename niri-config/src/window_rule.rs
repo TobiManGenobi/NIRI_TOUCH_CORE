@@ -79,6 +79,10 @@ pub struct WindowRule {
     pub pinch_sensitivity: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
     pub tiled_state: Option<bool>,
+    /// Let touch gestures pass through to the client instead of being
+    /// claimed by the compositor (feeds L3's `under_gesture_app` flag).
+    #[knuffel(child, unwrap(argument))]
+    pub touchscreen_gesture_passthrough: Option<bool>,
     #[knuffel(child, default)]
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
