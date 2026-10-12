@@ -834,8 +834,7 @@ fn a_device_removed_mid_sequence_leaves_no_routed_slot_behind() {
 /// A fixture whose only non-default setting is the touch-point overlay, so a
 /// failure below is about the overlay and not about gesture recognition.
 fn set_up_with_touch_points(mode: &str) -> (Fixture, ClientId) {
-    let config =
-        Config::parse_mem(&format!("gestures {{ show-touch-points {mode} }}")).unwrap().config;
+    let config = Config::parse_mem(&format!("gestures {{ show-touch-points {mode} }}")).unwrap();
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, OUTPUT);
@@ -846,7 +845,7 @@ fn set_up_with_touch_points(mode: &str) -> (Fixture, ClientId) {
     window.commit();
     f.roundtrip(id);
 
-    f
+    (f, id)
 }
 
 /// The overlay tracks the glass: a down produces a dot, a lift removes it.

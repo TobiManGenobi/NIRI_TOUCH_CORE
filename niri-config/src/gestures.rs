@@ -152,7 +152,6 @@ mod tests {
     fn parse(kdl: &str) -> ShowTouchPoints {
         Config::parse_mem(&format!("gestures {{ {kdl} }}"))
             .unwrap()
-            .config
             .gestures
             .show_touch_points
     }
@@ -206,8 +205,7 @@ mod tests {
             gestures { show-touch-points gestures }
             ",
         )
-        .unwrap()
-        .config;
+        .unwrap();
         assert_eq!(config.gestures.show_touch_points, ShowTouchPoints::Gestures);
     }
 }

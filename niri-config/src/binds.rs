@@ -1705,6 +1705,7 @@ mod tests {
             direction,
             edge: None,
             zone: None,
+            corner: None,
         }
     }
 
@@ -1714,6 +1715,7 @@ mod tests {
             direction: None,
             edge: Some(edge),
             zone,
+            corner: None,
         }
     }
 
