@@ -1,0 +1,5 @@
+# Cargo build artifacts (can be ~12G for niri)
+/target/
+
+# Never track nested repositories - the unified repo is the only git history here.
+.git/
