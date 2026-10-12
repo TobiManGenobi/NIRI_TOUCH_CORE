@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use niri_config::{
-    Action, Config, EdgeZone, Modifiers, PinchDirection, RotateDirection, ScreenEdge,
+    Action, Config, EdgeZone, Modifiers, PinchDirection, RotateDirection, ScreenCorner, ScreenEdge,
     SwipeDirection, Trigger,
 };
 use niri_ipc::TouchOwnership;
@@ -1956,6 +1956,49 @@ fn bind_for_trigger<'a>(config: &'a Config, trigger: &Trigger) -> Option<&'a nir
         return config.binds.find_touch_edge(edge, zone);
     }
 
+    if let Trigger::Corner { corner } = *trigger {
+        // Precedence: an explicit `Corner` bind always wins; failing that,
+        // fall back to the corner's vertical edge, unzoned.
+        //
+        // The fallback is deliberate and is the whole reason this arm is
+        // more than a one-line `config.binds.find(trigger)`. Until `Corner`
+        // existed, `trigger_for` *did* emit `TouchEdge { edge, zone: None }`
+        // for a `CornerSwipe`, so a `TouchEdge edge="left"` bind is a bind
+        // that demonstrably fires for both the top-left and the bottom-left
+        // corner on released builds. Dropping it would silently unbind a
+        // working configuration on upgrade — the gesture would keep being
+        // recognised and would simply do nothing, with nothing in the log
+        // to say why.
+        //
+        // It is also the only fallback: it is unzoned, exactly as before, so
+        // a *zoned* `TouchEdge` bind on that edge still does not fire for a
+        // corner. That preserves the old behaviour bit for bit rather than
+        // quietly widening it, and keeps `TopLeft`/`BottomLeft` sharing one
+        // bind only until the user writes a `Corner` bind for either.
+        //
+        // Left/right edges are the vertical edge of both their corners;
+        // top and bottom are not, which is why the old flattening only
+        // worked for the two side columns.
+        return config
+            .binds
+            .find_corner(corner)
+            .or_else(|| config.binds.find_touch_edge(corner_vertical_edge(corner), None));
+    }
+
+/// The vertical edge a corner used to be flattened onto.
+///
+/// Only the backward-compatibility fallback in [`bind_for_trigger`] needs
+/// this. Keeping it as its own named function, rather than inlining the
+/// `match` there, means the historical mapping is stated once and the
+/// `ScreenEdge` import stays justified even if the fallback is ever
+/// dropped.
+fn corner_vertical_edge(corner: ScreenCorner) -> ScreenEdge {
+    match corner {
+        ScreenCorner::TopLeft | ScreenCorner::BottomLeft => ScreenEdge::Left,
+        ScreenCorner::TopRight | ScreenCorner::BottomRight => ScreenEdge::Right,
+    }
+}
+
     if let Trigger::TouchTapHoldDrag {
         fingers,
         direction: Some(direction),
@@ -2085,16 +2128,24 @@ fn trigger_for(gesture: &touch_core::Gesture) -> Option<Trigger> {
                 Third::End => EdgeZone::End,
             }),
         },
-        // A corner swipe is reported as an edge swipe along the corner's
-        // vertical edge, unzoned: `TouchEdge` has no corner variant, and
-        // pinning it to one third would be a worse guess than matching the
-        // whole edge.
-        Gesture::CornerSwipe { corner, .. } => Trigger::TouchEdge {
-            edge: match corner {
-                Corner::TopLeft | Corner::BottomLeft => ScreenEdge::Left,
-                Corner::TopRight | Corner::BottomRight => ScreenEdge::Right,
+        // A corner swipe is its own trigger, not an edge swipe on the
+        // corner's vertical edge. L1 classifies the corner squares before
+        // the edge strips (crates/touch-core/src/contact.rs:232), so the
+        // recogniser never emits an `EdgeSwipe` for a gesture that started
+        // in one — the old flattening lost the top/bottom half and made
+        // `TopLeft` and `BottomLeft` indistinguishable to the config.
+        //
+        // The vertical-edge fallback this replaced is preserved in
+        // `bind_for_trigger`, which is where the precedence between the two
+        // belongs: a `Trigger` is what the gesture *is*, and "what it used
+        // to be spelled" is not part of that.
+        Gesture::CornerSwipe { corner, .. } => Trigger::Corner {
+            corner: match corner {
+                Corner::TopLeft => ScreenCorner::TopLeft,
+                Corner::TopRight => ScreenCorner::TopRight,
+                Corner::BottomLeft => ScreenCorner::BottomLeft,
+                Corner::BottomRight => ScreenCorner::BottomRight,
             },
-            zone: None,
         },
     })
 }
@@ -2145,7 +2196,12 @@ fn trigger_name(trigger: &Trigger) -> String {
             Some(zone) => format!("TouchEdge edge=\"{}\" zone=\"{}\"", lc(edge), lc(zone)),
             None => format!("TouchEdge edge=\"{}\"", lc(edge)),
         },
-        // `trigger_for` only ever produces the six touchscreen triggers
+        // `corner_kdl_name` rather than `lc`: the config spells corners
+        // `top-left`, which is not the lowercased `Debug` name `topleft`.
+        Trigger::Corner { corner } => {
+            format!("Corner corner=\"{}\"", niri_config::corner_kdl_name(corner))
+        },
+        // `trigger_for` only ever produces the seven touchscreen triggers
         // above, so this is unreachable in practice.
         _ => format!("{trigger:?}"),
     }
@@ -2662,6 +2718,220 @@ mod bind_lookup_tests {
         assert_eq!(
             gesture_action(&config, &swipe(touch_core::SwipeDirection::Down)),
             None
+        );
+    }
+
+    fn corner(corner: touch_core::Corner) -> GestureEvent {
+        GestureEvent::End {
+            gesture: touch_core::Gesture::CornerSwipe {
+                corner,
+                delta: 0.0,
+                progress: 1.0,
+            },
+            completed: true,
+        }
+    }
+
+    fn edge(edge: touch_core::Edge, third: touch_core::Third) -> GestureEvent {
+        GestureEvent::End {
+            gesture: touch_core::Gesture::EdgeSwipe {
+                edge,
+                third,
+                delta: 0.0,
+                progress: 1.0,
+            },
+            completed: true,
+        }
+    }
+
+    /// The headline case: a recognised corner swipe fires the `Corner` bind
+    /// the user wrote for that exact corner.
+    ///
+    /// Pre-fix, `trigger_for` flattened a `CornerSwipe` onto its vertical
+    /// edge, so with only a `Corner` bind configured nothing matched at all
+    /// and the gesture resolved to `None`.
+    #[test]
+    fn a_corner_bind_fires_for_its_own_corner() {
+        let config = config(
+            r#"
+            binds {
+                Corner corner="top-left" { toggle-overview; }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopLeft)),
+            Some(Action::ToggleOverview)
+        );
+    }
+
+    /// Each corner is a distinct gesture. This is the half of the bug the
+    /// old flattening could not express at all: `TopLeft` and `BottomLeft`
+    /// both became `edge="left"`, so binding one bound the other.
+    #[test]
+    fn each_corner_binds_independently() {
+        let config = config(
+            r#"
+            binds {
+                Corner corner="top-left" { toggle-overview; }
+                Corner corner="bottom-left" { close-window; }
+                Corner corner="top-right" { close-overview; }
+                Corner corner="bottom-right" { switch-preset-window-width; }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopLeft)),
+            Some(Action::ToggleOverview)
+        );
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::BottomLeft)),
+            Some(Action::CloseWindow)
+        );
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopRight)),
+            Some(Action::CloseOverview)
+        );
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::BottomRight)),
+            Some(Action::SwitchPresetWindowWidth)
+        );
+    }
+
+    /// A corner with no `Corner` bind of its own must not borrow a
+    /// *different* corner's bind, even when the two share a vertical edge.
+    #[test]
+    fn an_unbound_corner_does_not_borrow_a_sibling_corner_bind() {
+        let config = config(
+            r#"
+            binds {
+                Corner corner="top-left" { toggle-overview; }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::BottomLeft)),
+            None,
+            "bottom-left is a different square; top-left's bind must not leak"
+        );
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopRight)),
+            None
+        );
+    }
+
+    /// Family isolation, stated as precedence:
+    ///
+    /// 1. A `Corner` bind wins for a corner swipe.
+    /// 2. Otherwise a `TouchEdge` bind on the corner's vertical edge fires
+    ///    (the backward-compatibility fallback).
+    /// 3. A `Corner` bind never fires for an edge swipe, even on the edge
+    ///    that corner would have fallen back to.
+    #[test]
+    fn corner_precedence_over_the_vertical_edge_fallback() {
+        let config = config(
+            r#"
+            binds {
+                TouchEdge edge="left" { close-window; }
+                Corner corner="top-left" { toggle-overview; }
+            }
+            "#,
+        );
+
+        // 1. The explicit corner bind beats the edge bind that would
+    //    otherwise have fired for this same gesture.
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopLeft)),
+            Some(Action::ToggleOverview),
+            "a Corner bind must outrank the vertical-edge fallback"
+        );
+
+        // 2. No `Corner` bind for bottom-left, so it falls back to the
+        //    unzoned `edge="left"` bind exactly as it did before `Corner`
+        //    existed.
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::BottomLeft)),
+            Some(Action::CloseWindow),
+            "the vertical-edge fallback keeps existing configs working"
+        );
+
+        // 3. A plain left-edge swipe still resolves to the edge bind; the
+        //    top-left `Corner` bind is not in its family.
+        assert_eq!(
+            gesture_action(
+                &config,
+                &edge(touch_core::Edge::Left, touch_core::Third::Start)
+            ),
+            Some(Action::CloseWindow),
+            "a Corner bind must not fire for an edge swipe"
+        );
+    }
+
+    /// The fallback is unzoned, matching the old behaviour bit for bit. A
+    /// *zoned* `TouchEdge` bind did not fire for corners before, and still
+    /// does not.
+    #[test]
+    fn a_zoned_edge_bind_does_not_capture_a_corner() {
+        let config = config(
+            r#"
+            binds {
+                TouchEdge edge="left" zone="top" { close-window; }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            gesture_action(&config, &edge(touch_core::Edge::Left, touch_core::Third::Start)),
+            Some(Action::CloseWindow),
+            "the zone matches exactly"
+        );
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopLeft)),
+            None,
+            "the backward-compat fallback is unzoned, so a zoned bind does not capture corners"
+        );
+    }
+
+    /// With neither a `Corner` nor an edge bind on the right column, a
+    /// top-right corner resolves to nothing. Pre-fix it looked at `edge=right`,
+    /// which is absent here too, so this pins that the *only* thing that
+    /// changed is the precedence — not whether the gesture resolves.
+    #[test]
+    fn a_corner_with_no_bind_at_all_resolves_to_nothing() {
+        let config = config(
+            r#"
+            binds {
+                TouchEdge edge="left" { close-window; }
+            }
+            "#,
+        );
+
+        assert_eq!(
+            gesture_action(&config, &corner(touch_core::Corner::TopRight)),
+            None
+        );
+    }
+
+    /// `trigger_name` is what a client matches against to recognise its own
+    /// gesture stream, so the corner spelling must be exactly what the
+    /// config accepts — `top-left`, not the lowercased `Debug` name
+    /// `topleft`.
+    #[test]
+    fn a_corner_trigger_name_round_trips_to_the_config_spelling() {
+        assert_eq!(
+            trigger_name(&Trigger::Corner {
+                corner: ScreenCorner::TopLeft
+            }),
+            r#"Corner corner="top-left""#
+        );
+        assert_eq!(
+            trigger_name(&Trigger::Corner {
+                corner: ScreenCorner::BottomRight
+            }),
+            r#"Corner corner="bottom-right""#
         );
     }
 }

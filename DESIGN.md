@@ -108,7 +108,7 @@ gestures {
     bind Rotate  fingers=2 direction=cw      { rotate-window }
     bind Edge    edge=bottom                 { toggle-osk }
     bind Edge    edge=top zone=left          { toggle-overview }
-    bind Corner  corner=top-left             { toggle-overview }
+    bind Corner  corner="top-left"            { toggle-overview }
 }
 ```
 

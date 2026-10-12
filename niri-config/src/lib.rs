@@ -51,7 +51,8 @@ pub use crate::debug::Debug;
 pub use crate::error::{ConfigIncludeError, ConfigParseResult};
 pub use crate::gestures::Gestures;
 pub use crate::input::{
-    zone_kdl_name, EdgeZone, Input, ModKey, ScreenEdge, ScrollMethod, Touchscreen,
+    corner_kdl_name, zone_kdl_name, EdgeZone, Input, ModKey, ScreenCorner, ScreenEdge,
+    ScrollMethod, Touchscreen,
     TouchscreenGesturesConfig, TrackLayout, WarpMouseToFocusMode, Xkb,
 };
 pub use crate::layer_rule::LayerRule;
@@ -2875,18 +2876,97 @@ mod tests {
             .unwrap();
         assert_eq!(fallback.action, Action::CloseWindow);
 
-        // Corners carry no third, so they use the same unzoned fallback.
+        // A corner is no longer looked up here. It has its own `Corner`
+        // trigger, so `find_corner` is the only resolver that answers for
+        // one; this unzoned call is now reached only via the
+        // backward-compatibility fallback in `bind_for_trigger`, which
+        // prefers a `Corner` bind when there is one.
         let corner = config
             .binds
             .find_touch_edge(ScreenEdge::Left, None)
             .unwrap();
         assert_eq!(corner.action, Action::CloseWindow);
+        assert!(config
+            .binds
+            .find_corner(ScreenCorner::TopLeft)
+            .is_none());
 
         // No bind on that edge at all.
         assert!(config
             .binds
             .find_touch_edge(ScreenEdge::Bottom, Some(EdgeZone::Start))
             .is_none());
+    }
+
+    /// The `Corner` bind parses and resolves. This is the parse-side half of
+    /// the corner-grammar test; the fire-side half lives in
+    /// `src/input/touch_arbitration_grab.rs`.
+    #[test]
+    fn a_corner_bind_parses_and_resolves() {
+        let config = Config::parse_mem(
+            r#"
+            binds {
+                Corner corner="top-left" { toggle-overview; }
+                Corner corner="bottom-right" { close-window; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let top_left = config.binds.find_corner(ScreenCorner::TopLeft).unwrap();
+        assert_eq!(top_left.action, Action::ToggleOverview);
+        assert_eq!(top_left.key.trigger, Trigger::Corner {
+            corner: ScreenCorner::TopLeft
+        });
+
+        let bottom_right = config
+            .binds
+            .find_corner(ScreenCorner::BottomRight)
+            .unwrap();
+        assert_eq!(bottom_right.action, Action::CloseWindow);
+
+        // The other two corners are distinct gestures and stay unbound.
+        assert!(config.binds.find_corner(ScreenCorner::TopRight).is_none());
+        assert!(config
+            .binds
+            .find_corner(ScreenCorner::BottomLeft)
+            .is_none());
+    }
+
+    /// An unknown corner spelling is rejected, and the error lists what is
+    /// accepted — the same shape as the `edge=`/`zone=` errors.
+    #[test]
+    fn an_unknown_corner_spelling_is_rejected() {
+        let err = Config::parse_mem(
+            r#"
+            binds {
+                Corner corner="middle-left" { toggle-overview; }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("top-left|top-right|bottom-left|bottom-right"),
+            "the error must list the accepted spellings, got: {err:?}"
+        );
+    }
+
+    /// `corner=` belongs to `Corner` alone. Every other family rejects it
+    /// the way it rejects `edge=`/`zone=`, rather than silently swallowing
+    /// it — a swallowed property reads to the user as "it took effect".
+    #[test]
+    fn a_corner_property_is_rejected_on_other_families() {
+        for kdl in [
+            r#"TouchSwipe fingers=2 corner="top-left" { toggle-overview; }"#,
+            r#"TouchEdge edge="left" corner="top-left" { toggle-overview; }"#,
+            r#"TouchTap fingers=1 corner="top-left" { toggle-overview; }"#,
+        ] {
+            let err = Config::parse_mem(&format!("binds {{ {kdl} }}")).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("does not accept a `corner=` property"),
+                "`{kdl}` must reject corner=, got: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use smithay::input::keyboard::keysyms::KEY_NoSymbol;
 use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, KEYSYM_NO_FLAGS};
 use smithay::input::keyboard::Keysym;
 
-use crate::input::{zone_kdl_name, EdgeZone, ScreenEdge};
+use crate::input::{corner_kdl_name, zone_kdl_name, EdgeZone, ScreenCorner, ScreenEdge};
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
 use crate::utils::{expect_only_children, MergeWith};
 
@@ -63,6 +63,7 @@ pub(crate) fn is_gesture_family_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("TouchTap")
         || s.eq_ignore_ascii_case("TouchTapHoldDrag")
         || s.eq_ignore_ascii_case("TouchEdge")
+        || s.eq_ignore_ascii_case("Corner")
 }
 
 /// Splits `Ctrl+Shift+Foo` into `(modifiers, "Foo")`.
@@ -103,6 +104,7 @@ pub(crate) struct GestureTriggerProps<'a> {
     pub direction: Option<&'a str>,
     pub edge: Option<&'a str>,
     pub zone: Option<&'a str>,
+    pub corner: Option<&'a str>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -123,9 +125,8 @@ impl Binds {
     /// *different* zone never matches, and neither does a bind on another
     /// edge.
     ///
-    /// This also serves the corner case: L1's `Zone::Corner` has no
-    /// `third`, so the caller passes `zone: None` and gets the same
-    /// fallback the unzoned edge bind uses.
+    /// Corners carry no `third`, so there is nothing to widen a match on:
+    /// lookup is exact equality and nothing else.
     pub fn find_touch_edge(&self, edge: ScreenEdge, zone: Option<EdgeZone>) -> Option<&Bind> {
         self.find(&Trigger::TouchEdge { edge, zone }).or_else(|| {
             if zone.is_some() {
@@ -134,6 +135,25 @@ impl Binds {
                 None
             }
         })
+    }
+
+    /// The bind for a `Corner` gesture at `corner`.
+    ///
+    /// Lookup is exact equality, unlike [`Self::find_touch_edge`]: a corner
+    /// names one square of the screen and there is no coarser corner to fall
+    /// back to.
+    ///
+    /// This is *not* where the backward-compatibility fallback lives. Until
+    /// `Corner` existed, `trigger_for` flattened a `CornerSwipe` onto the
+    /// corner's vertical edge as an unzoned `TouchEdge`
+    /// (`src/input/touch_arbitration_grab.rs`), so an existing
+    /// `TouchEdge edge="left"` bind really does fire today for both the
+    /// top-left and bottom-left corners. Keeping that working is the
+    /// caller's job — `bind_for_trigger` tries this first and only then the
+    /// edge — because the rule is about *which gesture shape* outranks the
+    /// other, not about how either is stored.
+    pub fn find_corner(&self, corner: ScreenCorner) -> Option<&Bind> {
+        self.find(&Trigger::Corner { corner })
     }
 }
 
@@ -276,6 +296,19 @@ pub enum Trigger {
     TouchEdge {
         edge: ScreenEdge,
         zone: Option<EdgeZone>,
+    },
+
+    /// KDL syntax:
+    /// - `Corner corner="top-left"`
+    ///
+    /// A corner is where two edge strips meet. L1 classifies the corner
+    /// squares before the edge strips
+    /// (`crates/touch-core/src/contact.rs:232`), so a swipe starting in one
+    /// is a `CornerSwipe` and never an `EdgeSwipe` — a `TouchEdge` bind is
+    /// reachable only through the backward-compatible fallback documented
+    /// on [`Binds::find_corner`].
+    Corner {
+        corner: ScreenCorner,
     },
 }
 
@@ -1104,6 +1137,7 @@ where
         let mut gesture_direction: Option<String> = None;
         let mut gesture_edge: Option<String> = None;
         let mut gesture_zone: Option<String> = None;
+        let mut gesture_corner: Option<String> = None;
         for (name, val) in &node.properties {
             match &***name {
                 "repeat" => {
@@ -1146,6 +1180,9 @@ where
                 "zone" if is_gesture_family => {
                     gesture_zone = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
                 }
+                "corner" if is_gesture_family => {
+                    gesture_corner = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
                 name_str => {
                     ctx.emit_error(DecodeError::unexpected(
                         name,
@@ -1164,6 +1201,7 @@ where
                 direction: gesture_direction.as_deref(),
                 edge: gesture_edge.as_deref(),
                 zone: gesture_zone.as_deref(),
+                corner: gesture_corner.as_deref(),
             };
             match build_gesture_trigger(trigger_name, &props) {
                 Ok(trigger) => Key { trigger, modifiers },
@@ -1273,9 +1311,20 @@ pub(crate) fn build_gesture_trigger(
         }
         Ok(())
     };
+    // `corner=` is rejected everywhere except the `Corner` family, exactly
+    // as `edge=`/`zone=` are. Without this a `corner=` on a `TouchSwipe`
+    // would be silently ignored, and the user would read the swallowed
+    // property as "it took effect".
+    let reject_corner = |props: &GestureTriggerProps<'_>, family: &str| -> Result<(), String> {
+        if props.corner.is_some() {
+            return Err(format!("{family} does not accept a `corner=` property"));
+        }
+        Ok(())
+    };
 
     if family.eq_ignore_ascii_case("TouchSwipe") || family.eq_ignore_ascii_case("TouchpadSwipe") {
         reject_edge_zone(props)?;
+        reject_corner(props, family)?;
         let fingers = expect_fingers(props, MIN_FINGERS)?;
         let direction = props
             .direction
@@ -1300,6 +1349,7 @@ pub(crate) fn build_gesture_trigger(
 
     if family.eq_ignore_ascii_case("TouchPinch") || family.eq_ignore_ascii_case("TouchpadPinch") {
         reject_edge_zone(props)?;
+        reject_corner(props, family)?;
         // Touchpad pinch accepts 2 fingers — libinput emits pinch events
         // natively for 2/3/4 fingers. Touchscreen pinch stays at 3+ to
         // preserve 2-finger client passthrough (scroll/zoom).
@@ -1330,6 +1380,7 @@ pub(crate) fn build_gesture_trigger(
 
     if family.eq_ignore_ascii_case("TouchRotate") {
         reject_edge_zone(props)?;
+        reject_corner(props, family)?;
         let fingers = expect_fingers(props, MIN_FINGERS)?;
         let direction = props
             .direction
@@ -1351,6 +1402,7 @@ pub(crate) fn build_gesture_trigger(
         || family.eq_ignore_ascii_case("TouchpadTapHoldDrag")
     {
         reject_edge_zone(props)?;
+        reject_corner(props, family)?;
         let fingers = expect_fingers(props, MIN_FINGERS)?;
         if props.direction.is_some() {
             return Err(format!("{family} does not accept a `direction=` property"));
@@ -1366,6 +1418,7 @@ pub(crate) fn build_gesture_trigger(
 
     if family.eq_ignore_ascii_case("TouchTapHoldDrag") {
         reject_edge_zone(props)?;
+        reject_corner(props, family)?;
         let fingers = expect_fingers(props, MIN_FINGERS)?;
         // direction= is optional for TouchTapHoldDrag (unlike TouchSwipe
         // where it's required). None = omnidirectional.
@@ -1399,6 +1452,7 @@ pub(crate) fn build_gesture_trigger(
                 "TouchEdge uses `edge=` (not `direction=`) and an optional `zone=`".to_string(),
             );
         }
+        reject_corner(props, family)?;
         let edge = props
             .edge
             .ok_or_else(|| "TouchEdge requires `edge=\"left|right|top|bottom\"".to_string())?;
@@ -1441,6 +1495,53 @@ pub(crate) fn build_gesture_trigger(
             }
         };
         return Ok(Trigger::TouchEdge { edge, zone });
+    }
+
+    if family.eq_ignore_ascii_case("Corner") {
+        // `Corner` is the mirror image of `TouchEdge`: it takes `corner=`
+        // and nothing else, so edge/zone/fingers/direction are all rejected
+        // rather than ignored.
+        if props.fingers.is_some() {
+            return Err("Corner does not accept a `fingers=` property".to_string());
+        }
+        if props.direction.is_some() {
+            return Err("Corner does not accept a `direction=` property".to_string());
+        }
+        if props.edge.is_some() || props.zone.is_some() {
+            return Err(
+                "Corner uses `corner=` and does not accept `edge=` or `zone=`".to_string(),
+            );
+        }
+        // Every spelling this branch accepts is asked of `corner_kdl_name`,
+        // the same single-source-of-truth arrangement `TouchEdge` uses for
+        // its zone vocabulary: adding a corner variant to the enum without
+        // naming it here cannot produce a spelling that parses but is not
+        // the one `trigger_name` reports back to IPC clients.
+        const CORNERS: [ScreenCorner; 4] = [
+            ScreenCorner::TopLeft,
+            ScreenCorner::TopRight,
+            ScreenCorner::BottomLeft,
+            ScreenCorner::BottomRight,
+        ];
+        let corner = props.corner.ok_or_else(|| {
+            format!(
+                "Corner requires `corner=\"{}\"",
+                CORNERS
+                    .map(corner_kdl_name)
+                    .join("|")
+            )
+        })?;
+        let c_lower = corner.to_ascii_lowercase();
+        return match CORNERS
+            .into_iter()
+            .find(|&c| corner_kdl_name(c) == c_lower)
+        {
+            Some(corner) => Ok(Trigger::Corner { corner }),
+            None => Err(format!(
+                "invalid corner=\"{corner}\" (expected {})",
+                CORNERS.map(corner_kdl_name).join("|")
+            )),
+        }
     }
 
     Err(format!("unknown gesture family `{family}`"))

@@ -359,7 +359,7 @@ The other settings live in the same `gestures { ... }` block:
 The following bind triggers recognise touchscreen gestures.
 Each one takes its parameters as KDL properties on the bind, and all of them also accept the standard bind properties such as `repeat`, `cooldown-ms`, `allow-when-locked` and `emit-progress`.
 Modifiers work as usual, for example `Mod+TouchEdge edge="left"`.
-None of these families accepts an `edge=` or `zone=` property except `TouchEdge`, and none accepts `fingers=` except the five that need a finger count.
+None of these families accepts an `edge=` or `zone=` property except `TouchEdge`, none accepts a `corner=` property except `Corner`, and none accepts `fingers=` except the five that need a finger count.
 
 `fingers=` is required for `TouchSwipe`, `TouchPinch`, `TouchRotate`, `TouchTap` and `TouchTapHoldDrag`, and must be from `3` to `10`.
 The floor of 3 exists so that two-finger client passthrough (scrolling and zooming) keeps working.
@@ -400,6 +400,21 @@ binds {
 It does not accept `fingers=` or `direction=`.
 `zone=` picks one of the three thirds along the edge's perpendicular axis, and the vocabulary rotates with the edge: the `top` and `bottom` edges take `zone="left"|"center"|"right"`, while the `left` and `right` edges take `zone="top"|"center"|"bottom"`.
 When several binds match one gesture, a zoned bind is preferred over an unzoned one; an unzoned `TouchEdge` acts as the fallback for any zone.
+
+`Corner` requires `corner=`, which can be `top-left`, `top-right`, `bottom-left` or `bottom-right`.
+It does not accept `fingers=`, `direction=`, `edge=` or `zone=`.
+A corner is the square where two edge strips meet, and it is classified before the edge strips, so a swipe that starts in a corner square is a corner swipe and never an edge swipe.
+Each of the four corners binds independently.
+
+For backward compatibility, a corner with no `Corner` bind of its own falls back to an unzoned `TouchEdge` on its vertical edge — the `left` edge for the two left corners, the `right` edge for the two right corners.
+A `Corner` bind always takes precedence over that fallback, a zoned `TouchEdge` never captures a corner, and a `Corner` bind never fires for a plain edge swipe.
+
+```kdl
+binds {
+    Corner corner="top-left" { toggle-overview; }
+    Corner corner="bottom-right" { close-window; }
+}
+```
 
 ##### `emit-progress`
 

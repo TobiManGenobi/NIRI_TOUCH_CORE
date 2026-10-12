@@ -599,6 +599,35 @@ pub fn zone_kdl_name(edge: ScreenEdge, zone: EdgeZone) -> &'static str {
     }
 }
 
+/// One of the four screen corners, as used by `Corner` gesture binds.
+///
+/// Mirrors `touch_core::Corner` (crates/touch-core/src/contact.rs:144) one
+/// for one. The two enums stay separate on purpose: `touch-core` is a pure,
+/// clock-free L1/L2 crate that must not depend on the config crate, so the
+/// mapping is written out at the single site that crosses the boundary,
+/// [`Trigger::Corner`](crate::binds::Trigger::Corner) construction in
+/// `src/input/touch_arbitration_grab.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScreenCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Lower-cased corner name used in KDL config (`"top-left"`, ...).
+///
+/// Unlike [`zone_kdl_name`] this mapping does not rotate per axis: a corner
+/// names itself, so the four spellings are absolute.
+pub fn corner_kdl_name(corner: ScreenCorner) -> &'static str {
+    match corner {
+        ScreenCorner::TopLeft => "top-left",
+        ScreenCorner::TopRight => "top-right",
+        ScreenCorner::BottomLeft => "bottom-left",
+        ScreenCorner::BottomRight => "bottom-right",
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct Touchscreen {
     #[knuffel(child)]

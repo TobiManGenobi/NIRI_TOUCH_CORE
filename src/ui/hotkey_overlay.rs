@@ -572,7 +572,8 @@ fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
         | Trigger::TouchRotate { .. }
         | Trigger::TouchTap { .. }
         | Trigger::TouchTapHoldDrag { .. }
-        | Trigger::TouchEdge { .. } => String::from("Touch Gesture"),
+        | Trigger::TouchEdge { .. }
+        | Trigger::Corner { .. } => String::from("Touch Gesture"),
     };
     name.push_str(&pretty);
 
